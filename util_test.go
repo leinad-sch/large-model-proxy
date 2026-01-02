@@ -73,6 +73,27 @@ type OpenAiApiChatCompletionResponse struct {
 	} `json:"usage"`
 }
 
+// OpenAiApiEmbeddingRequest is used by /v1/embeddings
+type OpenAiApiEmbeddingRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+// OpenAiApiEmbeddingResponse is what /v1/embeddings returns
+type OpenAiApiEmbeddingResponse struct {
+	Object string `json:"object"`
+	Data   []struct {
+		Object    string    `json:"object"`
+		Index     int       `json:"index"`
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
+	Model string `json:"model"`
+	Usage struct {
+		PromptTokens int `json:"prompt_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
 func assertModelsResponse(test *testing.T, expectedIDs []string, resp *http.Response) {
 	test.Helper()
 	var modelsResp OpenAiApiModels
@@ -608,4 +629,44 @@ func assertRemoteClosedWithin(t *testing.T, connection net.Conn, within time.Dur
 
 func isConnectionReset(err error) bool {
 	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED)
+}
+
+func sendEmbeddingRequestExpectingSuccess(t *testing.T, address string, embeddingReq OpenAiApiEmbeddingRequest) OpenAiApiEmbeddingResponse {
+	t.Helper()
+	resp := sendEmbeddingRequest(t, address, embeddingReq)
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status code 200, got %d", resp.StatusCode)
+	}
+
+	var embeddingResp OpenAiApiEmbeddingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
+		t.Fatalf("Failed to decode /v1/embeddings response: %v", err)
+	}
+	return embeddingResp
+}
+
+func sendEmbeddingRequest(t *testing.T, address string, embeddingReq OpenAiApiEmbeddingRequest) *http.Response {
+	t.Helper()
+	reqBody, err := json.Marshal(embeddingReq)
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON body: %v", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/embeddings", address)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("/v1/embeddings request failed: %v", err)
+	}
+	return resp
 }

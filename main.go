@@ -627,6 +627,11 @@ func startOpenAiApi(OpenAiApi OpenAiApi, services []ServiceConfig) {
 			resetConnectionBuffer(request)
 		}
 	})
+	mux.HandleFunc("/v1/embeddings", func(responseWriter http.ResponseWriter, request *http.Request) {
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
 	mux.HandleFunc("/", func(responseWriter http.ResponseWriter, request *http.Request) {
 		//404
 		log.Printf("[OpenAI API Server] Request to unsupported URL: %s %s", request.Method, request.RequestURI)
