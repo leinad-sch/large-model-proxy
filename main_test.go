@@ -313,6 +313,19 @@ func testOpenAiApi(test *testing.T) {
 		test.Fatalf("openai-api_openai-api-2 service is still running, but inactivity timeout should have shut it down by now")
 	}
 	assertPortsAreClosed(test, []string{"localhost:12011", "localhost:12012", "localhost:12013", "localhost:12014", "localhost:12016", "localhost:12017", "localhost:12018"})
+
+	// Test embeddings endpoint
+	embeddingReq := OpenAiApiEmbeddingRequest{
+		Model: "openai-api_openai-api-1",
+		Input: []string{"This is a test embedding input"},
+	}
+	embeddingResp := sendEmbeddingRequestExpectingSuccess(test, "http://localhost:2016", embeddingReq)
+	if len(embeddingResp.Data) == 0 {
+		test.Fatalf("No embedding data returned in response: %+v", embeddingResp)
+	}
+	if embeddingResp.Model != "openai-api_openai-api-1" {
+		test.Fatalf("Model mismatch in embedding response. Expected: %q, Got: %q", "openai-api_openai-api-1", embeddingResp.Model)
+	}
 }
 
 func testOpenAiApiReusingConnection(test *testing.T) {
