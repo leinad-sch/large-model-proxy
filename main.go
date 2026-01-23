@@ -324,6 +324,54 @@ func startOpenAiApi(OpenAiApi OpenAiApi, services []ServiceConfig) {
 			resetConnectionBuffer(request)
 		}
 	})
+	mux.HandleFunc("/completion", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/infill", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/messages", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/responses", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/rerank", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/rerank", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/reranking", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/messages/count_tokens", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
 	mux.HandleFunc("/", func(responseWriter http.ResponseWriter, request *http.Request) {
 		//404
 		log.Printf("[OpenAI API Server] Request to unsupported URL: %s %s", request.Method, request.RequestURI)
