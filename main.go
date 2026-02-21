@@ -15,6 +15,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+    "strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -54,6 +55,30 @@ type OpenAiApiModel struct {
 }
 type ModelContainingRequest struct {
 	Model string `json:"model"`
+}
+
+// SlotActionRequest represents the request body for slot actions
+type SlotActionRequest struct {
+	Action     string `json:"action"`     // "restore" or "save"
+	Filename   string `json:"filename"`   // "${slot}.bin"
+	SlotID     int    `json:"id_slot"`    // Slot identifier
+}
+
+// SlotActionResponse represents the response for slot actions
+type SlotActionResponse struct {
+	Success    bool   `json:"success"`
+	Message    string `json:"message,omitempty"`
+	SlotID     int    `json:"id_slot"`
+	Filename   string `json:"filename"`
+}
+
+// LlamaServerSlotConfig stores configuration for llama-server slot persistence
+type LlamaServerSlotConfig struct {
+	Command         string // Service command
+	Args            string // Service arguments
+	SlotSavePath    string // Path where slots are saved
+	NumSlots        int    // Number of slots (parsed from --parallel)
+	IsEnabled       bool   // Whether slot persistence is enabled
 }
 
 func (rm ResourceManager) maybeGetRunningServiceNoLock(name string) (RunningService, bool) {
@@ -117,7 +142,94 @@ var (
 	serviceConfigByName map[string]*ServiceConfig
 	resourceManager     ResourceManager
 	interrupted         = false
+	slotManagementClient *http.Client // HTTP client for slot management
 )
+
+// initSlotManagementClient initializes the HTTP client for slot management API calls
+func initSlotManagementClient() {
+	slotManagementClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+}
+
+// isLlamaServerWithSlots checks if a service configuration enables slot persistence
+func isLlamaServerWithSlots(serviceConfig ServiceConfig) bool {
+	// Check command contains "llama-server" (case-insensitive)
+	lowerCommand := strings.ToLower(serviceConfig.Command)
+	if !strings.Contains(lowerCommand, "llama-server") {
+		return false
+	}
+
+	// Parse arguments
+	args, err := shlex.Split(serviceConfig.Args)
+	if err != nil {
+		return false
+	}
+
+	// Check for required arguments
+	hasParallel := false
+	hasSlots := false
+	hasSlotSavePath := false
+	//var slotSavePath string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--parallel":
+			hasParallel = true
+		case "--slots":
+			hasSlots = true
+		case "--slot-save-path":
+			//if i+1 < len(args) {
+			//	slotSavePath = args[i+1]
+			//}
+			hasSlotSavePath = true
+		}
+	}
+
+	return hasParallel && hasSlots && hasSlotSavePath
+}
+
+// parseNumSlots extracts the number of slots from the --parallel argument
+func parseNumSlots(args string) (int, error) {
+	argsList, err := shlex.Split(args)
+	if err != nil {
+		return 0, err
+	}
+
+	for i := 0; i < len(argsList); i++ {
+		if argsList[i] == "--parallel" && i+1 < len(argsList) {
+			numStr := argsList[i+1]
+			return strconv.Atoi(numStr)
+		}
+	}
+
+	return 0, fmt.Errorf("--parallel argument not found")
+}
+
+// buildSlotFilename constructs the filename for a given slot ID
+func buildSlotFilename(slotID int) string {
+	return fmt.Sprintf("%d.bin", slotID)
+}
+
+// buildSlotFilePath constructs the full path to a slot file
+func buildSlotFilePath(slotSavePath string, slotID int) string {
+	return filepath.Join(slotSavePath, buildSlotFilename(slotID))
+}
+
+// extractSlotSavePath extracts the --slot-save-path argument value
+func extractSlotSavePath(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--slot-save-path" && i+1 < len(args) {
+			return args[i+1]
+		}
+	}
+	return ""
+}
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -158,6 +270,9 @@ func main() {
 		serviceMutex:       &sync.Mutex{},
 	}
 
+	// Initialize slot management HTTP client
+	initSlotManagementClient()
+
 	for name, resource := range config.ResourcesAvailable {
 		//Using int reference to avoid having a lock for reading from the map
 		resourceManager.resourcesAvailable[name] = new(int)
@@ -196,6 +311,101 @@ func main() {
 		log.Printf("Done, exiting")
 		os.Exit(0)
 	}
+}
+
+// restoreSlot restores a slot from disk
+func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
+	// Construct slot filename
+	filename := buildSlotFilename(slotID)
+	filePath := buildSlotFilePath(slotSavePath, slotID)
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("slot file not found: %s", filePath)
+	}
+
+	// Send restore request to service
+	url := fmt.Sprintf("http://%s:%s/slots/%d?action=restore",
+		serviceConfig.ProxyTargetHost,
+		serviceConfig.ProxyTargetPort,
+		slotID)
+
+	payload := SlotActionRequest{
+		Action:     "restore",
+		Filename:   filename,
+		SlotID:     slotID,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Send HTTP POST request with timeout
+	resp, err := slotManagementClient.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("failed to send restore request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("restore request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Read response
+	var respBody SlotActionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	log.Printf("[%s] Slot %d restored successfully: %s", serviceConfig.Name, slotID, respBody.Message)
+	return nil
+}
+
+// saveSlot saves a slot to disk
+func saveSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
+	// Construct slot filename
+	filename := buildSlotFilename(slotID)
+	//filePath := buildSlotFilePath(slotSavePath, slotID)
+
+	// Send save request to service
+	url := fmt.Sprintf("http://%s:%s/slots/%d?action=save",
+		serviceConfig.ProxyTargetHost,
+		serviceConfig.ProxyTargetPort,
+		slotID)
+
+	payload := SlotActionRequest{
+		Action:     "save",
+		Filename:   filename,
+		SlotID:     slotID,
+	}
+
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Send HTTP POST request with timeout
+	resp, err := slotManagementClient.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return fmt.Errorf("failed to send save request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("save request failed with status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Read response
+	var respBody SlotActionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	log.Printf("[%s] Slot %d saved successfully: %s", serviceConfig.Name, slotID, respBody.Message)
+	return nil
 }
 
 func findServiceConfigByName(serviceName string) *ServiceConfig {
@@ -703,6 +913,29 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 	log.Printf("[%s] Service started with pid %d", serviceConfig.Name, cmd.Process.Pid)
 	if interrupted {
 		return nil, fmt.Errorf("interrupt signal was received")
+	}
+
+	// Check if this is a llama-server with slots and restore them
+	if isLlamaServerWithSlots(serviceConfig) {
+		args, err := shlex.Split(serviceConfig.Args)
+		if err == nil {
+			slotSavePath := extractSlotSavePath(args)
+			if slotSavePath != "" {
+				numSlots, err := parseNumSlots(serviceConfig.Args)
+				if err == nil {
+					// Restore all slots
+					log.Printf("[%s] Restoring %d slots from %s", serviceConfig.Name, numSlots, slotSavePath)
+					for slotID := 0; slotID < numSlots; slotID++ {
+						if err := restoreSlot(serviceConfig, slotID, slotSavePath); err != nil {
+							log.Printf("[%s] Warning: Failed to restore slot %d: %v", serviceConfig.Name, slotID, err)
+							// Continue with rest of slots
+						}
+					}
+				} else {
+					log.Printf("[%s] Warning: Failed to parse number of slots: %v", serviceConfig.Name, err)
+				}
+			}
+		}
 	}
 
 	var serviceConnection, processExited = tryConnectingUntilTimeoutOrProcessExit(
@@ -1307,6 +1540,29 @@ func forwardConnection(clientConnection, serviceConnection net.Conn, serviceName
 }
 
 func stopService(service ServiceConfig) {
+	// Check if this is a llama-server with slots and save them
+	if isLlamaServerWithSlots(service) {
+		args, err := shlex.Split(service.Args)
+		if err == nil {
+			slotSavePath := extractSlotSavePath(args)
+			if slotSavePath != "" {
+				numSlots, err := parseNumSlots(service.Args)
+				if err == nil {
+					// Save all slots
+					log.Printf("[%s] Saving %d slots to %s", service.Name, numSlots, slotSavePath)
+					for slotID := 0; slotID < numSlots; slotID++ {
+						if err := saveSlot(service, slotID, slotSavePath); err != nil {
+							log.Printf("[%s] Warning: Failed to save slot %d: %v", service.Name, slotID, err)
+							// Continue with rest of slots
+						}
+					}
+				} else {
+					log.Printf("[%s] Warning: Failed to parse number of slots: %v", service.Name, err)
+				}
+			}
+		}
+	}
+
 	runningService, ok := resourceManager.maybeGetRunningService(service.Name)
 	if !ok {
 		log.Printf("[%s] Warning: Failed to find a service in a list of running services while stopping it, multiple stops requested or service already died. Stop aborted.", service.Name)
