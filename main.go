@@ -313,10 +313,52 @@ func main() {
 	}
 }
 
+// performSlotAction sends a slot action request to the service
+func performSlotAction(serviceConfig ServiceConfig, slotID int, action string) (*SlotActionResponse, error) {
+	// Construct URL based on action
+	url := fmt.Sprintf("http://%s:%s/slots/%d?action=%s",
+		serviceConfig.ProxyTargetHost,
+		serviceConfig.ProxyTargetPort,
+		slotID,
+		action)
+
+	// Create payload with action and slot ID
+	payload := SlotActionRequest{
+		Action: action,
+		SlotID: slotID,
+	}
+
+	// Marshal to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Send HTTP POST request
+	resp, err := slotManagementClient.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send %s request: %w", action, err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s request failed with status %d: %s", action, resp.StatusCode, string(body))
+	}
+
+	// Decode response
+	var respBody SlotActionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &respBody, nil
+}
+
 // restoreSlot restores a slot from disk
 func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
-	// Construct slot filename
-	filename := buildSlotFilename(slotID)
+	// Construct file path
 	filePath := buildSlotFilePath(slotSavePath, slotID)
 
 	// Check if file exists
@@ -325,85 +367,27 @@ func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) e
 	}
 
 	// Send restore request to service
-	url := fmt.Sprintf("http://%s:%s/slots/%d?action=restore",
-		serviceConfig.ProxyTargetHost,
-		serviceConfig.ProxyTargetPort,
-		slotID)
-
-	payload := SlotActionRequest{
-		Action:     "restore",
-		Filename:   filename,
-		SlotID:     slotID,
-	}
-
-	jsonPayload, err := json.Marshal(payload)
+	respBody, err := performSlotAction(serviceConfig, slotID, "restore")
 	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
+		return err
 	}
 
-	// Send HTTP POST request with timeout
-	resp, err := slotManagementClient.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return fmt.Errorf("failed to send restore request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("restore request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Read response
-	var respBody SlotActionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
+	// Log success message with response data
 	log.Printf("[%s] Slot %d restored successfully: %s", serviceConfig.Name, slotID, respBody.Message)
 	return nil
 }
 
 // saveSlot saves a slot to disk
 func saveSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
-	// Construct slot filename
-	filename := buildSlotFilename(slotID)
 	//filePath := buildSlotFilePath(slotSavePath, slotID)
 
 	// Send save request to service
-	url := fmt.Sprintf("http://%s:%s/slots/%d?action=save",
-		serviceConfig.ProxyTargetHost,
-		serviceConfig.ProxyTargetPort,
-		slotID)
-
-	payload := SlotActionRequest{
-		Action:     "save",
-		Filename:   filename,
-		SlotID:     slotID,
-	}
-
-	jsonPayload, err := json.Marshal(payload)
+	respBody, err := performSlotAction(serviceConfig, slotID, "save")
 	if err != nil {
-		return fmt.Errorf("failed to marshal request: %w", err)
+		return err
 	}
 
-	// Send HTTP POST request with timeout
-	resp, err := slotManagementClient.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return fmt.Errorf("failed to send save request: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("save request failed with status %d: %s", resp.StatusCode, string(body))
-	}
-
-	// Read response
-	var respBody SlotActionResponse
-	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
-		return fmt.Errorf("failed to decode response: %w", err)
-	}
-
+	// Log success message with response data
 	log.Printf("[%s] Slot %d saved successfully: %s", serviceConfig.Name, slotID, respBody.Message)
 	return nil
 }
@@ -1551,9 +1535,12 @@ func stopService(service ServiceConfig) {
 					// Save all slots
 					log.Printf("[%s] Saving %d slots to %s", service.Name, numSlots, slotSavePath)
 					for slotID := 0; slotID < numSlots; slotID++ {
-						if err := saveSlot(service, slotID, slotSavePath); err != nil {
+						respBody, err := performSlotAction(service, slotID, "save")
+						if err != nil {
 							log.Printf("[%s] Warning: Failed to save slot %d: %v", service.Name, slotID, err)
 							// Continue with rest of slots
+						} else {
+							log.Printf("[%s] Slot %d saved successfully: %s", service.Name, slotID, respBody.Message)
 						}
 					}
 				} else {
