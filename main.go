@@ -220,12 +220,12 @@ type rawCaptureConnection struct {
 	buffer *bytes.Buffer
 }
 
-func (rcc *rawCaptureConnection) Read(p []byte) (int, error) {
-	n, err := rcc.Conn.Read(p)
+func (rawCaptureConn *rawCaptureConnection) Read(p []byte) (int, error) {
+	n, err := rawCaptureConn.Conn.Read(p)
 	if n > 0 {
-		rcc.mutex.Lock()
-		rcc.buffer.Write(p[:n])
-		rcc.mutex.Unlock()
+		rawCaptureConn.mutex.Lock()
+		rawCaptureConn.buffer.Write(p[:n])
+		rawCaptureConn.mutex.Unlock()
 	}
 	return n, err
 }
@@ -391,8 +391,8 @@ func startOpenAiApi(OpenAiApi OpenAiApi, services []ServiceConfig) {
 		// Whenever the server accepts a new net.Conn, this callback runs.
 		// If it's our rawCaptureConnection, store it in the request context.
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if rcc, ok := c.(*rawCaptureConnection); ok {
-				return context.WithValue(ctx, rawConnectionContextKey, rcc)
+			if rawCaptureConn, ok := c.(*rawCaptureConnection); ok {
+				return context.WithValue(ctx, rawConnectionContextKey, rawCaptureConn)
 			}
 			return ctx
 		},
@@ -463,7 +463,7 @@ func handleCompletions(responseWriter http.ResponseWriter, request *http.Request
 		http.Error(responseWriter, "Request forwarding is not possible, please use HTTP 1.1", http.StatusInternalServerError)
 		return false
 	}
-	clientConnection, bufrw, err := hijacker.Hijack()
+	clientConnection, bufferedReaderWriter, err := hijacker.Hijack()
 	if err != nil {
 		log.Printf("[OpenAI API Server] Failed to forward connection: %v", err)
 		http.Error(responseWriter, err.Error(), http.StatusInternalServerError)
@@ -476,9 +476,9 @@ func handleCompletions(responseWriter http.ResponseWriter, request *http.Request
 	}
 	rawRequestBytes := rawConnection.buffer.Bytes()
 
-	if bufrw.Reader.Buffered() > 0 {
-		bufBytes := make([]byte, bufrw.Reader.Buffered())
-		if _, err := bufrw.Read(bufBytes); err != nil {
+	if bufferedReaderWriter.Reader.Buffered() > 0 {
+		bufBytes := make([]byte, bufferedReaderWriter.Reader.Buffered())
+		if _, err := bufferedReaderWriter.Read(bufBytes); err != nil {
 			log.Printf("[OpenAI API Server] Error reading buffered data: : %v", err)
 		}
 		bodyBytes = append(bodyBytes, bufBytes...)
