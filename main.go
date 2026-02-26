@@ -314,7 +314,7 @@ func main() {
 }
 
 // performSlotAction sends a slot action request to the service
-func performSlotAction(serviceConfig ServiceConfig, slotID int, action string) (*SlotActionResponse, error) {
+func performSlotAction(serviceConfig ServiceConfig, slotID int, action string, filename string) (*SlotActionResponse, error) {
 	// Construct URL based on action
 	url := fmt.Sprintf("http://%s:%s/slots/%d?action=%s",
 		serviceConfig.ProxyTargetHost,
@@ -322,11 +322,16 @@ func performSlotAction(serviceConfig ServiceConfig, slotID int, action string) (
 		slotID,
 		action)
 
-	// Create payload with action and slot ID
+	// Create payload with action, slot ID, and filename
 	payload := SlotActionRequest{
-		Action: action,
-		SlotID: slotID,
+		Action:   action,
+		SlotID:   slotID,
+		Filename: filename,
 	}
+
+	// Log the request for debugging
+	log.Printf("[%s] Slot %d %s request: action=%s, slot_id=%d, filename=%s",
+		serviceConfig.Name, slotID, action, action, slotID, filename)
 
 	// Marshal to JSON
 	jsonPayload, err := json.Marshal(payload)
@@ -366,8 +371,11 @@ func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) e
 		return fmt.Errorf("slot file not found: %s", filePath)
 	}
 
+	// Build the filename for the restore request
+	filename := buildSlotFilename(slotID)
+
 	// Send restore request to service
-	respBody, err := performSlotAction(serviceConfig, slotID, "restore")
+	respBody, err := performSlotAction(serviceConfig, slotID, "restore", filename)
 	if err != nil {
 		return err
 	}
@@ -381,8 +389,11 @@ func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) e
 func saveSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
 	//filePath := buildSlotFilePath(slotSavePath, slotID)
 
+	// Build the filename for the save request
+	filename := buildSlotFilename(slotID)
+
 	// Send save request to service
-	respBody, err := performSlotAction(serviceConfig, slotID, "save")
+	respBody, err := performSlotAction(serviceConfig, slotID, "save", filename)
 	if err != nil {
 		return err
 	}
@@ -1535,7 +1546,8 @@ func stopService(service ServiceConfig) {
 					// Save all slots
 					log.Printf("[%s] Saving %d slots to %s", service.Name, numSlots, slotSavePath)
 					for slotID := 0; slotID < numSlots; slotID++ {
-						respBody, err := performSlotAction(service, slotID, "save")
+						filename := buildSlotFilename(slotID)
+						respBody, err := performSlotAction(service, slotID, "save", filename)
 						if err != nil {
 							log.Printf("[%s] Warning: Failed to save slot %d: %v", service.Name, slotID, err)
 							// Continue with rest of slots
