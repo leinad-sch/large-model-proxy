@@ -416,6 +416,19 @@ func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) e
 	// Construct file path
 	filePath := buildSlotFilePath(slotSavePath, slotID)
 
+	// Extract directory path from file path
+	dirPath := filepath.Dir(filePath)
+
+	// Check if directory exists, create if missing
+	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(dirPath, 0755); err != nil {
+			return fmt.Errorf("failed to create slot directory %s: %w", dirPath, err)
+		}
+		log.Printf("[%s] Created slot directory: %s", serviceConfig.Name, dirPath)
+	} else if err != nil {
+		return fmt.Errorf("failed to check slot directory %s: %w", dirPath, err)
+	}
+
 	// Check if file exists
 	if _, err := os.Stat(filePath); os.IsNotExist(err) {
 		return fmt.Errorf("slot file not found: %s", filePath)
@@ -437,8 +450,6 @@ func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) e
 
 // saveSlot saves a slot to disk
 func saveSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
-	//filePath := buildSlotFilePath(slotSavePath, slotID)
-
 	// Build the filename for the save request
 	filename := buildSlotFilename(slotID)
 
