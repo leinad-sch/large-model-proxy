@@ -1,0 +1,17 @@
+# /etc/systemd/system/large-model-proxy-monitor.service
+[Unit]
+Description=GPU‑aware monitor for large‑model‑proxy
+After=network.target
+
+[Service]
+Type=simple
+Environment=POLLING_INTERVAL=5
+Environment=IDLE_THRESHOLD=2
+Environment=IDLE_DURATION=60
+Environment=PROXY_CMD=/usr/local/bin/large-model-proxy -c /etc/large-model-proxy/config.jsonc
+Environment=PID_FILE=/run/large-model-proxy.pid
+ExecStart=/usr/local/bin/large-model-proxy-monitor
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
