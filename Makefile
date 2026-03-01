@@ -5,6 +5,8 @@ executable:
 	go build -o large-model-proxy
 executable-linux:
 	env GOOS=linux go build -o large-model-proxy-linux
+executable-linux-docker:
+	docker run -e GOOS=linux --rm -v $(pwd):/app -w /app golang:1.26-alpine go build -o large-model-proxy-linux
 clean:
 	go clean
 	cd test-server

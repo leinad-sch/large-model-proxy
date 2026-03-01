@@ -1,0 +1,43 @@
+{
+  //"DefaultServiceUrl": "http://localhost:{{.PORT}}/",
+  //"OpenAiApi": {
+  //  "ListenPort": "7070"
+  //},
+  //"ManagementApi": {
+  //  "ListenPort": "7071"
+  //},
+  //"MaxTimeToWaitForServiceToCloseConnectionBeforeGivingUpSeconds": 1200,
+  //"ShutDownAfterInactivitySeconds": 120,
+  "ResourcesAvailable": {
+    //"VRAM-GPU-1": {
+    //  "Amount": 7805,
+    //  "CheckCommand": "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 0",
+    //  "CheckIntervalMilliseconds": 1000
+    //},
+    //"VRAM-GPU-2": {
+    //  "Amount": 11909,
+    //  "CheckCommand": "nvidia-smi --query-gpu=memory.free --format=csv,noheader,nounits -i 1",
+    //  "CheckIntervalMilliseconds": 1000
+    //},
+    //"RAM": {
+    //  "CheckCommand": "awk '/MemAvailable/ {printf \"%d\\n\", $2/1024}' /proc/meminfo",
+    //  "CheckIntervalMilliseconds": 1000
+    //},
+    "example_resource1": {
+      "Amount": 123
+    },
+    "example_resource2": 456
+  },
+  "Services": [
+    {
+      //"Name": "jsonc-test",
+      ////Look ma, a comment!
+      //"ListenPort": "2048",
+      //"ProxyTargetHost": "localhost",
+      //"ProxyTargetPort": "12048",
+      //"Command": "../../test-server/test-server",
+      //"LogFilePath": "../../test-logs/default-config-file-name-jsonc.log",
+      //"Args": "-p 12048"
+    }
+  ]
+}
