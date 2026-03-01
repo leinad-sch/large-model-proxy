@@ -148,26 +148,14 @@ func initSlotManagementClient() {
 	}
 }
 
-// isLlamaServerWithSlots checks if a service configuration enables slot persistence
-func isLlamaServerWithSlots(serviceConfig ServiceConfig) bool {
-	// Check command contains "llama-server" (case-insensitive)
-	lowerCommand := strings.ToLower(serviceConfig.Command)
-	if !strings.Contains(lowerCommand, "llama-server") {
-		return false
-	}
-
-	// Parse arguments using shared parsing logic
-	result := parseSlotArgs(serviceConfig.Args)
-	return result.hasParallel && result.hasSlots && result.hasSlotSavePath && result.err == nil
-}
-
 // slotParseResult holds the result of parsing slot arguments
 type slotParseResult struct {
-	hasParallel   bool
-	hasSlots      bool
-	hasSlotSavePath bool
-	numSlots      int
-	err           error
+	hasParallel       bool
+	hasSlots          bool
+	hasSlotSavePath   bool
+	slotSavePath      string
+	numSlots          int
+	err               error
 }
 
 // parseSlotArgs extracts slot configuration from service arguments
@@ -181,6 +169,7 @@ func parseSlotArgs(argsStr string) slotParseResult {
 	hasParallel := false
 	hasSlots := false
 	hasSlotSavePath := false
+	var slotSavePath string
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
@@ -202,19 +191,15 @@ func parseSlotArgs(argsStr string) slotParseResult {
 			if i+1 >= len(args) {
 				return slotParseResult{err: fmt.Errorf("--slot-save-path argument missing value")}
 			}
+			slotSavePath = args[i+1]
 		}
 	}
 
 	result.hasParallel = hasParallel
 	result.hasSlots = hasSlots
 	result.hasSlotSavePath = hasSlotSavePath
+	result.slotSavePath = slotSavePath
 	return result
-}
-
-// parseNumSlots extracts the number of slots from the --parallel argument
-func parseNumSlots(args string) (int, error) {
-	result := parseSlotArgs(args)
-	return result.numSlots, result.err
 }
 
 // buildSlotFilename constructs the filename for a given slot ID
@@ -227,38 +212,23 @@ func buildSlotFilePath(slotSavePath string, slotID int) string {
 	return filepath.Join(slotSavePath, buildSlotFilename(slotID))
 }
 
-// extractSlotSavePath extracts the --slot-save-path argument value
-func extractSlotSavePath(args []string) string {
-	for i := 0; i < len(args); i++ {
-		if args[i] == "--slot-save-path" && i+1 < len(args) {
-			return args[i+1]
-		}
-	}
-	return ""
-}
 
 // manageSlots handles slot save/restore operations for a service
 func manageSlots(service ServiceConfig, action string) {
-	if !isLlamaServerWithSlots(service) {
+	// Check if this is a llama-server with slots
+	lowerCommand := strings.ToLower(service.Command)
+	if !strings.Contains(lowerCommand, "llama-server") {
 		return
 	}
 
-	args, err := shlex.Split(service.Args)
-	if err != nil {
-		log.Printf("[%s] Warning: Failed to parse service arguments: %v", service.Name, err)
+	// Validate and extract info in one call
+	result := parseSlotArgs(service.Args)
+	if result.err != nil || !result.hasParallel || !result.hasSlots || !result.hasSlotSavePath {
 		return
 	}
 
-	slotSavePath := extractSlotSavePath(args)
-	if slotSavePath == "" {
-		return
-	}
-
-	numSlots, err := parseNumSlots(service.Args)
-	if err != nil {
-		log.Printf("[%s] Warning: Failed to parse number of slots: %v", service.Name, err)
-		return
-	}
+	slotSavePath := result.slotSavePath
+	numSlots := result.numSlots
 
 	log.Printf("[%s] %s %d slots from/to %s", service.Name, strings.Title(action), numSlots, slotSavePath)
 
