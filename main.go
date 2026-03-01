@@ -389,12 +389,9 @@ func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) e
 	// Extract directory path from file path
 	dirPath := filepath.Dir(filePath)
 
-	// Check if directory exists, create if missing
+	// Check if directory exists
 	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
-		if err := os.MkdirAll(dirPath, 0755); err != nil {
-			return fmt.Errorf("failed to create slot directory %s: %w", dirPath, err)
-		}
-		log.Printf("[%s] Created slot directory: %s", serviceConfig.Name, dirPath)
+		log.Printf("[WARNING] Slot directory does not exist: %s. Slot restore may fail if the directory is expected to be managed externally.", dirPath)
 	} else if err != nil {
 		return fmt.Errorf("failed to check slot directory %s: %w", dirPath, err)
 	}
