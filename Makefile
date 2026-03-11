@@ -3,6 +3,8 @@ test: executable build-test-server
 	go test -v -parallel 500 #Tests have a lot of sleeps in them, not CPU bound
 executable:
 	go build -o large-model-proxy
+executable-linux:
+	env GOOS=linux go build -o large-model-proxy-linux
 clean:
 	go clean
 	cd test-server
