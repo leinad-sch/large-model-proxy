@@ -25,15 +25,16 @@ import (
 )
 
 type RunningService struct {
-	manageMutex       *sync.Mutex
-	cmd               *exec.Cmd
-	activeConnections int
-	lastUsed          *time.Time
-	idleTimer         *time.Timer
-	exitWaitGroup     *sync.WaitGroup
-	resourcesReleased *bool
-	stdoutWriter      *serviceLoggingWriter
-	stderrWriter      *serviceLoggingWriter
+	manageMutex           *sync.Mutex
+	cmd                   *exec.Cmd
+	activeConnections     int
+	lastUsed              *time.Time
+	idleTimer             *time.Timer
+	exitWaitGroup         *sync.WaitGroup
+	resourcesReleased     *bool
+	stdoutWriter          *serviceLoggingWriter
+	stderrWriter          *serviceLoggingWriter
+	healthCheckReturnCode *int // nil if no health check configured or not yet run, 0 if healthy, -1 if unhealthy with exit code, -2 if timed out, non-zero if unhealthy with specific exit code
 }
 
 type ResourceManager struct {
@@ -922,7 +923,11 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 		startupConnectionTimeout = time.Duration(*serviceConfig.StartupTimeoutMilliseconds) * time.Millisecond
 	}
 	giveUpTime := time.Now().Add(startupConnectionTimeout)
-	err := performHealthCheck(serviceConfig, startupConnectionTimeout)
+
+	// Initialize health check return code to nil before performing health check
+	runningService.healthCheckReturnCode = nil
+
+	err := performHealthCheck(serviceConfig, startupConnectionTimeout, &runningService)
 	if err != nil {
 		log.Printf("[%s] Stopping service due to healthcheck error: %v", serviceConfig.Name, err)
 		runningService.manageMutex.Unlock()
@@ -989,7 +994,8 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 
 	return serviceConnection, nil
 }
-func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) error {
+
+func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration, runningService *RunningService) error {
 	if serviceConfig.HealthcheckCommand == "" {
 		return nil
 	}
@@ -1003,6 +1009,9 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) erro
 	} else {
 		sleepDuration = time.Duration(serviceConfig.HealthcheckIntervalMilliseconds) * time.Millisecond
 	}
+
+	timeoutCode := -2 // sentinel value to distinguish timeout from actual exit codes
+	zeroInt := 0
 
 	for {
 		if interrupted {
@@ -1035,6 +1044,7 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) erro
 
 		if waitErr == nil {
 			log.Printf("[%s] Healthcheck \"%s\" returned exit code 0, healthcheck completed", serviceConfig.Name, serviceConfig.HealthcheckCommand)
+			runningService.healthCheckReturnCode = &zeroInt
 			return nil
 		}
 
@@ -1042,6 +1052,7 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) erro
 		if exitError, ok := waitErr.(*exec.ExitError); ok {
 			exitCode = exitError.ExitCode()
 		}
+		runningService.healthCheckReturnCode = &exitCode
 
 		log.Printf(
 			"[%s] Healthcheck \"%s\" returned exit code %d, trying again in %s",
@@ -1053,6 +1064,8 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) erro
 
 		remainingUntilDeadlineDuration = time.Until(totalTimeoutDeadlineTime)
 		if sleepDuration > remainingUntilDeadlineDuration {
+			// Health check timed out, set the timeout code
+			runningService.healthCheckReturnCode = &timeoutCode
 			return fmt.Errorf(
 				"healthcheck timed out, not starting another healthcheck command due to less time than %dms left out of %s",
 				sleepDuration,
@@ -1087,6 +1100,7 @@ func connectToService(serviceConfig ServiceConfig) net.Conn {
 	}
 	return serviceConn
 }
+
 func tryConnectingUntilTimeoutOrProcessExit(
 	serviceHost string,
 	servicePort string,
