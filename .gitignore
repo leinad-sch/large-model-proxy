@@ -11,8 +11,5 @@ test-server/test-server
 node_modules
 
 .idea/
-.llm/
-.kilocodemodes
-.kilocode
-plans
+.peru/
 task*.md
