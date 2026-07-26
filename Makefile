@@ -1,16 +1,18 @@
 all: executable build-test-server
 
+docker: executable-docker build-test-server-docker
+
 test: executable build-test-server
-	go test -v -parallel 500 # Tests have a lot of sleeps in them, not CPU bound
+	go test -v -parallel 500 -timeout=1m # Tests have a lot of sleeps in them, not CPU bound
 
 test-docker: executable-docker build-test-server-docker
-	docker run --rm -v .:/app -w /app golang:1.26-alpine go test -v -parallel 500 # Tests have a lot of sleeps in them, not CPU bound
+	docker run --rm -v "./.mod:/go/pkg/mod" -v .:/app -w /app golang:1.26-alpine go test -v -parallel 500 -timeout=1m # Tests have a lot of sleeps in them, not CPU bound
 
 executable:
 	go build -o large-model-proxy
 
 executable-docker:
-	docker run -e GOOS=linux --rm -v .:/app -w /app golang:1.26-alpine go build -o large-model-proxy
+	docker run -e GOOS=linux --rm -v "./.mod:/go/pkg/mod" -v .:/app -w /app golang:1.26-alpine go build -o large-model-proxy
 
 executable-linux:
 	env GOOS=linux go build -o large-model-proxy-linux
@@ -32,4 +34,4 @@ build-test-server:
 	go build -o test-server/test-server test-server/main.go
 
 build-test-server-docker:
-	docker run -e GOOS=linux --rm -v .:/app -w /app golang:1.26-alpine go build -o test-server/test-server test-server/main.go
+	docker run -e GOOS=linux --rm -v "./.mod:/go/pkg/mod" -v .:/app -w /app golang:1.26-alpine go build -o test-server/test-server test-server/main.go
