@@ -376,7 +376,7 @@ func startLargeModelProxy(testCaseName string, configPath string, workDir string
 	err = cmd.Process.Signal(syscall.Signal(0))
 	if err != nil {
 		if err.Error() == "os: process already finished" {
-			return nil, fmt.Errorf("large-model-proxy exited prematurely")
+			return nil, fmt.Errorf("large-model-proxy exited prematurely with error")
 		}
 		return nil, fmt.Errorf("error checking process state: %w", err)
 	}
@@ -522,16 +522,19 @@ func attemptReadHealthcheckResponse(t *testing.T, address string) (HealthCheckRe
 	t.Helper()
 	resp, err := http.Get(fmt.Sprintf("http://%s/", address))
 	if err != nil {
+		t.Logf("attemptReadHealthcheckResponse error for %s: %v", address, err)
 		return HealthCheckResponse{}, fmt.Errorf("failed to get healthcheck response: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		t.Logf("attemptReadHealthcheckResponse read body error for %s: %v", address, err)
 		return HealthCheckResponse{}, fmt.Errorf("failed to read body: %w", err)
 	}
 	var healthCheckResponse HealthCheckResponse
 	if err := json.Unmarshal(body, &healthCheckResponse); err != nil {
+		t.Logf("attemptReadHealthcheckResponse unmarshal error for %s, body=%s: %v", address, string(body), err)
 		return HealthCheckResponse{}, fmt.Errorf("failed to decode healthcheck response JSON: %w; body=%s", err, string(body))
 	}
 	return healthCheckResponse, nil
