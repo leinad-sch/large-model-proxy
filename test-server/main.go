@@ -609,27 +609,27 @@ type OpenAiApiEmbeddingResponse struct {
 
 func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received Embeddings request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-	
+
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
-	
+
 	var embeddingRequest OpenAiApiEmbeddingRequest
 	if err := json.NewDecoder(r.Body).Decode(&embeddingRequest); err != nil {
 		log.Printf("Failed to parse embedding request body: %v", err)
 		http.Error(w, fmt.Sprintf("Failed to parse embedding request body: %v", err), http.StatusBadRequest)
 		return
 	}
-	
+
 	w.Header().Set("Content-Type", "application/json")
-	
+
 	// Create a sample embedding response
 	response := OpenAiApiEmbeddingResponse{
 		Object: "list",
 		Model:  embeddingRequest.Model,
 	}
-	
+
 	// Generate embeddings for each input
 	for i, input := range embeddingRequest.Input {
 		// Create a simple mock embedding - in a real implementation, this would be actual embedding values
@@ -643,7 +643,7 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			}
 			embedding[j] = float64(hash*(i+1)*(j+1)) / 1000000.0
 		}
-		
+
 		response.Data = append(response.Data, struct {
 			Object    string    `json:"object"`
 			Index     int       `json:"index"`
@@ -654,11 +654,11 @@ func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
 			Embedding: embedding,
 		})
 	}
-	
+
 	// Set usage stats
 	response.Usage.PromptTokens = len(embeddingRequest.Input) * 5 // Mock value
 	response.Usage.TotalTokens = response.Usage.PromptTokens
-	
+
 	if err := json.NewEncoder(w).Encode(response); err != nil {
 		log.Printf("Failed to encode embedding response: %v", err)
 		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
