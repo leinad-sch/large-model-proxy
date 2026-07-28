@@ -1422,13 +1422,19 @@ func releaseReservedResourcesWhenServiceMutexIsLocked(reserved map[string]int) {
 }
 
 type serviceLoggingWriter struct {
-	prefix string
-	logger *log.Logger
-	buf    []byte // holds an incomplete line between Write calls
+	prefix     string
+	logger     *log.Logger
+	buf        []byte // holds an incomplete line between Write calls
+	writeMutex sync.Mutex
 }
 
 func (w *serviceLoggingWriter) FinalFlush() {
-	if w == nil || len(w.buf) == 0 {
+	if w == nil {
+		return
+	}
+	w.writeMutex.Lock()
+	defer w.writeMutex.Unlock()
+	if len(w.buf) == 0 {
 		return
 	}
 	w.logger.Print(w.prefix + string(w.buf))
@@ -1447,6 +1453,8 @@ func findLowerIndexThatIsNotMinusOne(indexOne int, indexTwo int) int {
 	return indexOne
 }
 func (w *serviceLoggingWriter) Write(b []byte) (int, error) {
+	w.writeMutex.Lock()
+	defer w.writeMutex.Unlock()
 	// append new bytes to anything left over from the previous call
 	data := append(w.buf, b...)
 	for {
