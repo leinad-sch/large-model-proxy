@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/google/shlex"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 type RunningService struct {
@@ -231,7 +233,7 @@ func manageSlots(service ServiceConfig, action string) {
 	slotSavePath := result.slotSavePath
 	numSlots := result.numSlots
 
-	log.Printf("[%s] %s %d slots from/to %s", service.Name, strings.Title(action), numSlots, slotSavePath)
+	log.Printf("[%s] %s %d slots from/to %s", service.Name, cases.Title(language.Und, cases.NoLower).String(action), numSlots, slotSavePath)
 
 	for slotID := 0; slotID < numSlots; slotID++ {
 		filename := buildSlotFilename(slotID)
