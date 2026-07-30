@@ -609,6 +609,7 @@ func startOpenAiApi(OpenAiApi OpenAiApi, services []ServiceConfig) {
 		}
 	})
 	mux.HandleFunc("/v1/embeddings", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
 		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
 			resetConnectionBuffer(request)
 		}
