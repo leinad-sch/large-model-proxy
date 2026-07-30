@@ -36,7 +36,7 @@ type RunningService struct {
 	resourcesReleased     *bool
 	stdoutWriter          *serviceLoggingWriter
 	stderrWriter          *serviceLoggingWriter
-	healthCheckReturnCode *int // nil if no health check configured or not yet run, 0 if healthy, -1 if unhealthy with exit code, -2 if timed out, non-zero if unhealthy with specific exit code
+	healthCheckReturnCode *int // nil if no health check configured, HealthCheckNotYetRun (-1) if configured but not yet run, HealthCheckHealthy (0) if healthy, HealthCheckTimedOut (-2) if timed out, positive integer if health check failed with specific exit code
 }
 
 type ResourceManager struct {
@@ -62,17 +62,17 @@ type ModelContainingRequest struct {
 
 // SlotActionRequest represents the request body for slot actions
 type SlotActionRequest struct {
-	Action     string `json:"action"`     // "restore" or "save"
-	Filename   string `json:"filename"`   // "${slot}.bin"
-	SlotID     int    `json:"id_slot"`    // Slot identifier
+	Action   string `json:"action"`   // "restore" or "save"
+	Filename string `json:"filename"` // "${slot}.bin"
+	SlotID   int    `json:"id_slot"`  // Slot identifier
 }
 
 // SlotActionResponse represents the response for slot actions
 type SlotActionResponse struct {
-	Success    bool   `json:"success"`
-	Message    string `json:"message,omitempty"`
-	SlotID     int    `json:"id_slot"`
-	Filename   string `json:"filename"`
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+	SlotID   int    `json:"id_slot"`
+	Filename string `json:"filename"`
 }
 
 func (rm ResourceManager) maybeGetRunningServiceNoLock(name string) (RunningService, bool) {
@@ -131,11 +131,24 @@ func (rm ResourceManager) createRunningService(serviceConfig ServiceConfig) Runn
 	return rs
 }
 
+const (
+	// Health check return code sentinel values.
+	// healthCheckReturnCode is nil if no health check is configured,
+	// points to one of these values, or points to a positive integer
+	// if the health check failed with a specific exit code.
+	// health check configured but not yet run/running
+	HealthCheckNotYetRun = -1
+	// health check passed
+	HealthCheckHealthy = 0
+	// health check timed out
+	HealthCheckTimedOut = -2
+)
+
 var (
-	config              Config
-	serviceConfigByName map[string]*ServiceConfig
-	resourceManager     ResourceManager
-	interrupted         = false
+	config               Config
+	serviceConfigByName  map[string]*ServiceConfig
+	resourceManager      ResourceManager
+	interrupted          = false
 	slotManagementClient *http.Client // HTTP client for slot management
 )
 
@@ -153,12 +166,12 @@ func initSlotManagementClient() {
 
 // slotParseResult holds the result of parsing slot arguments
 type slotParseResult struct {
-	hasParallel       bool
-	hasSlots          bool
-	hasSlotSavePath   bool
-	slotSavePath      string
-	numSlots          int
-	err               error
+	hasParallel     bool
+	hasSlots        bool
+	hasSlotSavePath bool
+	slotSavePath    string
+	numSlots        int
+	err             error
 }
 
 // parseSlotArgs extracts slot configuration from service arguments
@@ -927,8 +940,13 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 	}
 	giveUpTime := time.Now().Add(startupConnectionTimeout)
 
-	// Initialize health check return code to nil before performing health check
-	runningService.healthCheckReturnCode = nil
+	// Initialize health check return code to HealthCheckNotYetRun if health check is configured
+	if serviceConfig.HealthcheckCommand != "" {
+		code := HealthCheckNotYetRun
+		runningService.healthCheckReturnCode = &code
+	} else {
+		runningService.healthCheckReturnCode = nil
+	}
 
 	err := performHealthCheck(serviceConfig, startupConnectionTimeout, &runningService)
 	if err != nil {
@@ -972,21 +990,25 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 	}
 
 	idleTimeout := getIdleTimeout(serviceConfig)
-	runningService.idleTimer = time.AfterFunc(idleTimeout, func() {
-		if interrupted {
-			return
-		}
-		resourceManager.serviceMutex.Lock()
-		shouldStop := canBeStopped(serviceConfig.Name)
-		resourceManager.serviceMutex.Unlock()
-		if shouldStop {
-			log.Printf("[%s] Idle timeout %s reached, stopping service", serviceConfig.Name, idleTimeout)
-			stopService(serviceConfig)
-		} else {
-			log.Printf("[%s] Idle timeout %s reached, but service is busy, resetting idle time", serviceConfig.Name, idleTimeout)
-			runningService.idleTimer.Reset(getIdleTimeout(serviceConfig))
-		}
-	})
+	if idleTimeout == 0 {
+		// 0 means no idle timeout configured, don't create a timer
+	} else {
+		runningService.idleTimer = time.AfterFunc(idleTimeout, func() {
+			if interrupted {
+				return
+			}
+			resourceManager.serviceMutex.Lock()
+			shouldStop := canBeStopped(serviceConfig.Name)
+			resourceManager.serviceMutex.Unlock()
+			if shouldStop {
+				log.Printf("[%s] Idle timeout %s reached, stopping service", serviceConfig.Name, idleTimeout)
+				stopService(serviceConfig)
+			} else {
+				log.Printf("[%s] Idle timeout %s reached, but service is busy, resetting idle time", serviceConfig.Name, idleTimeout)
+				runningService.idleTimer.Reset(getIdleTimeout(serviceConfig))
+			}
+		})
+	}
 	if interrupted {
 		return nil, fmt.Errorf("interrupt signal was received")
 	}
@@ -996,6 +1018,22 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 	resourceManager.serviceMutex.Unlock()
 
 	return serviceConnection, nil
+}
+
+func updateRunningServiceHealthCheckCode(serviceName string, code *int) {
+	resourceManager.serviceMutex.Lock()
+	if rs, ok := resourceManager.runningServices[serviceName]; ok {
+		rs.healthCheckReturnCode = code
+		resourceManager.runningServices[serviceName] = rs
+	}
+	resourceManager.serviceMutex.Unlock()
+}
+
+// updateHealthCheckCode updates both the local RunningService pointer
+// and the map entry with the health check return code.
+func updateHealthCheckCode(rs *RunningService, name string, code *int) {
+	rs.healthCheckReturnCode = code
+	updateRunningServiceHealthCheckCode(name, code)
 }
 
 func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration, runningService *RunningService) error {
@@ -1013,8 +1051,8 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration, runn
 		sleepDuration = time.Duration(serviceConfig.HealthcheckIntervalMilliseconds) * time.Millisecond
 	}
 
-	timeoutCode := -2 // sentinel value to distinguish timeout from actual exit codes
-	zeroInt := 0
+	timeoutCode := HealthCheckTimedOut
+	healthyCode := HealthCheckHealthy
 
 	for {
 		if interrupted {
@@ -1023,60 +1061,82 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration, runn
 
 		remainingUntilDeadlineDuration := time.Until(totalTimeoutDeadlineTime)
 		if remainingUntilDeadlineDuration <= 0 {
+			// Health check timed out before starting, set the timeout code
+			updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
 			return fmt.Errorf("healthcheck timed out after %s", timeout)
 		}
 
-		cmd := exec.Command("sh", "-c", serviceConfig.HealthcheckCommand)
+		ctx, cancel := context.WithTimeout(context.Background(), remainingUntilDeadlineDuration)
+		cmd := exec.CommandContext(ctx, "sh", "-c", serviceConfig.HealthcheckCommand)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setpgid: true,
+			Pgid:    0,
+		}
 		if err := cmd.Start(); err != nil {
+			cancel()
 			log.Printf("[%s] Failed to start healthcheck command \"%s\": %v", serviceConfig.Name, serviceConfig.HealthcheckCommand, err)
+			updateHealthCheckCode(runningService, serviceConfig.Name, runningService.healthCheckReturnCode)
 			return fmt.Errorf("failed to start healthcheck command \"%s\": %w", serviceConfig.HealthcheckCommand, err)
 		}
 
-		waitResultChan := make(chan error, 1)
-		go func() { waitResultChan <- cmd.Wait() }()
+		// Use goroutine to wait for process completion, then select on context or process exit
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- cmd.Wait()
+		}()
 
-		var waitErr error
 		select {
-		case waitErr = <-waitResultChan:
-			// finished within the remaining time
-		case <-time.After(remainingUntilDeadlineDuration):
-			_ = cmd.Process.Kill()
-			<-waitResultChan
-			return fmt.Errorf("starting healthcheck command timed out after %s", remainingUntilDeadlineDuration)
-		}
+		case <-ctx.Done():
+			// Context cancelled or timed out - kill the process
+			cancel()
+			_ = cmd.Process.Kill() // Force terminate; error ignored as process may already be exiting
+			<-errCh                // Wait for Wait() to complete
+			updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
+			return fmt.Errorf("healthcheck command timed out after %s", remainingUntilDeadlineDuration)
+		case err := <-errCh:
+			// Process completed - check result
+			if ctx.Err() != nil {
+				// Context was also cancelled while waiting
+				cancel()
+				updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
+				return fmt.Errorf("healthcheck command timed out after %s", remainingUntilDeadlineDuration)
+			}
+			if err == nil {
+				log.Printf("[%s] Healthcheck \"%s\" returned exit code 0, healthcheck completed", serviceConfig.Name, serviceConfig.HealthcheckCommand)
+				cancel()
+				updateHealthCheckCode(runningService, serviceConfig.Name, &healthyCode)
+				return nil
+			}
+			// Health check command completed but with non-zero exit code
+			exitCode := -1
+			if exitError, ok := err.(*exec.ExitError); ok {
+				exitCode = exitError.ExitCode()
+			}
+			updateHealthCheckCode(runningService, serviceConfig.Name, &exitCode)
 
-		if waitErr == nil {
-			log.Printf("[%s] Healthcheck \"%s\" returned exit code 0, healthcheck completed", serviceConfig.Name, serviceConfig.HealthcheckCommand)
-			runningService.healthCheckReturnCode = &zeroInt
-			return nil
-		}
-
-		exitCode := -1
-		if exitError, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exitError.ExitCode()
-		}
-		runningService.healthCheckReturnCode = &exitCode
-
-		log.Printf(
-			"[%s] Healthcheck \"%s\" returned exit code %d, trying again in %s",
-			serviceConfig.Name,
-			serviceConfig.HealthcheckCommand,
-			exitCode,
-			sleepDuration,
-		)
-
-		remainingUntilDeadlineDuration = time.Until(totalTimeoutDeadlineTime)
-		if sleepDuration > remainingUntilDeadlineDuration {
-			// Health check timed out, set the timeout code
-			runningService.healthCheckReturnCode = &timeoutCode
-			return fmt.Errorf(
-				"healthcheck timed out, not starting another healthcheck command due to less time than %dms left out of %s",
+			log.Printf(
+				"[%s] Healthcheck \"%s\" returned exit code %d, trying again in %s",
+				serviceConfig.Name,
+				serviceConfig.HealthcheckCommand,
+				exitCode,
 				sleepDuration,
-				timeout,
 			)
-		}
-		if sleepDuration > 0 {
-			time.Sleep(sleepDuration)
+
+			remainingUntilDeadlineDuration = time.Until(totalTimeoutDeadlineTime)
+			if sleepDuration > remainingUntilDeadlineDuration {
+				// Health check timed out, set the timeout code
+				cancel()
+				updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
+				return fmt.Errorf(
+					"healthcheck timed out, not starting another healthcheck command due to less time than %dms left out of %s",
+					sleepDuration,
+					timeout,
+				)
+			}
+			if sleepDuration > 0 {
+				time.Sleep(sleepDuration)
+			}
+			cancel()
 		}
 	}
 }
@@ -1518,9 +1578,7 @@ func forwardConnection(clientConnection, serviceConnection net.Conn, serviceName
 			EOFOnWriteFromServerToClient = new(bool)
 			*EOFOnWriteFromServerToClient = true
 		}
-		// Once done copying client->service, close service side.
-		err := serviceConnection.Close()
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := serviceConnection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("[%s] Error closing service to client connection: %v", serviceName, err)
 		}
 	}()

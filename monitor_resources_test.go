@@ -8,6 +8,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+// maxHealthCheckAttempts is the maximum number of attempts to wait for a service health check to succeed.
+const maxHealthCheckAttempts = 50
+
 // testResourceCheckCommand
 // The test resource availability increases by 1 with each check which is
 // scheduled to be every second.
@@ -67,6 +70,7 @@ func testResourceCheckCommand(
 	time.Sleep(1000 * time.Millisecond)
 	var serviceOneHealthCheckResponse HealthCheckResponse
 	var resourceAvailableAmountExpected int
+	attempts := 0
 	for {
 		//The resource is available now, but we need more time for the check to realize this.
 		// This can be removed after https://github.com/perk11/large-model-proxy/issues/94 is implemented.
@@ -74,7 +78,8 @@ func testResourceCheckCommand(
 
 		serviceOneHealthCheckResponse, err = attemptReadHealthcheckResponse(t, serviceOneHealthCheckAddress)
 		statusResponse = getStatusFromManagementAPI(t, managementApiAddress)
-		if resourceAvailableAmountExpected > 5 {
+		attempts++
+		if attempts > maxHealthCheckAttempts {
 			t.Fatalf("service one should have started by now")
 			return
 		}
