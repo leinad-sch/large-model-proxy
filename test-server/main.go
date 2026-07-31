@@ -318,6 +318,7 @@ func OpenAiApiListen(port *string) {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/completions", handleCompletions)
 	mux.HandleFunc("/v1/chat/completions", handleChatCompletions)
+	mux.HandleFunc("/v1/embeddings", handleEmbeddings)
 
 	server := &http.Server{
 		Addr:    ":" + *port,
@@ -585,6 +586,84 @@ func parseAndValidateChatRequest(w http.ResponseWriter, r *http.Request) (OpenAi
 	}
 	w.Header().Set("Content-Type", "application/json")
 	return req, false
+}
+
+type OpenAiApiEmbeddingRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+type OpenAiApiEmbeddingResponse struct {
+	Object string `json:"object"`
+	Data   []struct {
+		Object    string    `json:"object"`
+		Index     int       `json:"index"`
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
+	Model string `json:"model"`
+	Usage struct {
+		PromptTokens int `json:"prompt_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
+func handleEmbeddings(w http.ResponseWriter, r *http.Request) {
+	log.Printf("Received Embeddings request: %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+	
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	
+	var embeddingRequest OpenAiApiEmbeddingRequest
+	if err := json.NewDecoder(r.Body).Decode(&embeddingRequest); err != nil {
+		log.Printf("Failed to parse embedding request body: %v", err)
+		http.Error(w, fmt.Sprintf("Failed to parse embedding request body: %v", err), http.StatusBadRequest)
+		return
+	}
+	
+	w.Header().Set("Content-Type", "application/json")
+	
+	// Create a sample embedding response
+	response := OpenAiApiEmbeddingResponse{
+		Object: "list",
+		Model:  embeddingRequest.Model,
+	}
+	
+	// Generate embeddings for each input
+	for i, input := range embeddingRequest.Input {
+		// Create a simple mock embedding - in a real implementation, this would be actual embedding values
+		// For testing purposes, we'll generate deterministic values based on the input
+		embedding := make([]float64, 3)
+		for j := range embedding {
+			// Simple hash-based approach for deterministic mock embeddings
+			hash := 0
+			for _, c := range input {
+				hash = hash*31 + int(c)
+			}
+			embedding[j] = float64(hash*(i+1)*(j+1)) / 1000000.0
+		}
+		
+		response.Data = append(response.Data, struct {
+			Object    string    `json:"object"`
+			Index     int       `json:"index"`
+			Embedding []float64 `json:"embedding"`
+		}{
+			Object:    "embedding",
+			Index:     i,
+			Embedding: embedding,
+		})
+	}
+	
+	// Set usage stats
+	response.Usage.PromptTokens = len(embeddingRequest.Input) * 5 // Mock value
+	response.Usage.TotalTokens = response.Usage.PromptTokens
+	
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("Failed to encode embedding response: %v", err)
+		http.Error(w, "Failed to encode response", http.StatusInternalServerError)
+		return
+	}
 }
 
 func procListen(port string) {
