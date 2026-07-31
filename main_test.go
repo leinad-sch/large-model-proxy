@@ -313,6 +313,19 @@ func testOpenAiApi(test *testing.T) {
 		test.Fatalf("openai-api_openai-api-2 service is still running, but inactivity timeout should have shut it down by now")
 	}
 	assertPortsAreClosed(test, []string{"localhost:12011", "localhost:12012", "localhost:12013", "localhost:12014", "localhost:12016", "localhost:12017", "localhost:12018"})
+
+	// Test embeddings endpoint
+	embeddingReq := OpenAiApiEmbeddingRequest{
+		Model: "openai-api_openai-api-1",
+		Input: []string{"This is a test embedding input"},
+	}
+	embeddingResp := sendEmbeddingRequestExpectingSuccess(test, "http://localhost:2016", embeddingReq)
+	if len(embeddingResp.Data) == 0 {
+		test.Fatalf("No embedding data returned in response: %+v", embeddingResp)
+	}
+	if embeddingResp.Model != "openai-api_openai-api-1" {
+		test.Fatalf("Model mismatch in embedding response. Expected: %q, Got: %q", "openai-api_openai-api-1", embeddingResp.Model)
+	}
 }
 
 func testOpenAiApiReusingConnection(test *testing.T) {
@@ -647,7 +660,7 @@ func testStreamingRequest(t *testing.T, url string, requestBodyObject any, expec
 
 func testVerifyArgsAndEnv(test *testing.T, procPort string, mustHaveEnv bool) {
 	client := &http.Client{}
-	req, err := http.NewRequest("GET", fmt.Sprintf("http://localhost:%s/procinfo", procPort), nil)
+	req, err := http.NewRequest("GET", fmt.Sprintf("http://127.0.0.1:%s/procinfo", procPort), nil)
 	if err != nil {
 		test.Fatalf("Failed to create request: %v", err)
 	}
@@ -936,7 +949,7 @@ func TestAppScenarios(test *testing.T) {
 							ProxyTargetPort:                 "12001",
 							Command:                         "./test-server/test-server",
 							Args:                            "-p 12001 -healthcheck-port 2011 -sleep-before-listening 10s -sleep-before-listening-for-healthcheck 3s -startup-duration 5s",
-							HealthcheckCommand:              "curl --fail http://localhost:2011",
+							HealthcheckCommand:              "if command -v wget >/dev/null 2>&1; then wget -q -S --spider -T 2 \"http://localhost:2011/\"; else curl --fail -s \"http://localhost:2011/\"; fi",
 							HealthcheckIntervalMilliseconds: 200,
 						},
 					},
@@ -958,7 +971,7 @@ func TestAppScenarios(test *testing.T) {
 							ProxyTargetPort:                 "12002",
 							Command:                         "./test-server/test-server",
 							Args:                            "-p 12002 -healthcheck-port 2012 -sleep-before-listening-for-healthcheck 3s -startup-duration 5s",
-							HealthcheckCommand:              "curl --fail http://localhost:2012",
+							HealthcheckCommand:              "if command -v wget >/dev/null 2>&1; then wget -q -S --spider -T 2 \"http://localhost:2012/\"; else curl --fail -s \"http://localhost:2012/\"; fi",
 							HealthcheckIntervalMilliseconds: 200,
 						},
 					},
@@ -980,7 +993,7 @@ func TestAppScenarios(test *testing.T) {
 							ProxyTargetPort:                 "12003",
 							Command:                         "./test-server/test-server",
 							Args:                            "-p 12003 -healthcheck-port 2013 -sleep-before-listening-for-healthcheck 3s -startup-duration 5s",
-							HealthcheckCommand:              "curl --fail http://localhost:2013",
+							HealthcheckCommand:              "if command -v wget >/dev/null 2>&1; then wget -q -S --spider -T 2 \"http://localhost:2013/\"; else curl --fail -s \"http://localhost:2013/\"; fi",
 							HealthcheckIntervalMilliseconds: 200,
 						},
 					},
@@ -1002,7 +1015,7 @@ func TestAppScenarios(test *testing.T) {
 							ProxyTargetPort:                 "12004",
 							Command:                         "./test-server/test-server",
 							Args:                            "-p 12004 -healthcheck-port 2014",
-							HealthcheckCommand:              "curl --fail http://localhost:2014",
+							HealthcheckCommand:              "if command -v wget >/dev/null 2>&1; then wget -q -S --spider -T 2 \"http://localhost:2014/\"; else curl --fail -s \"http://localhost:2014/\"; fi",
 							HealthcheckIntervalMilliseconds: 200,
 						},
 					},
@@ -1667,6 +1680,7 @@ func TestAppScenarios(test *testing.T) {
 			},
 			TestFunc: func(t *testing.T) {
 				testLogOutput(t,
+					"logs-output",
 					"localhost:2049",
 					"localhost:2054",
 					"localhost:2057",
@@ -1737,6 +1751,7 @@ func TestAppScenarios(test *testing.T) {
 			},
 			TestFunc: func(t *testing.T) {
 				testLogOutput(t,
+					"logs-no-output",
 					"localhost:2055",
 					"localhost:2056",
 					"localhost:2059",
@@ -1978,6 +1993,7 @@ func testUnmonitoredProcess(
 
 func testLogOutput(
 	t *testing.T,
+	testName string,
 	serviceOneAddress string,
 	serviceTwoAddress string,
 	serviceThreeAddress string,
@@ -1990,7 +2006,6 @@ func testLogOutput(
 	serviceFourName string,
 	shouldLog bool,
 ) {
-	const logFileName = "test-logs/test_logs-output.log"
 	pidOne := runReadPidCloseConnection(t, serviceOneAddress)
 	pidTwo := runReadPidCloseConnection(t, serviceTwoAddress)
 	connThree, err := net.Dial("tcp", serviceThreeAddress)
@@ -2005,6 +2020,7 @@ func testLogOutput(
 	defer func(connFour net.Conn) { _ = connFour.Close() }(connFour)
 
 	time.Sleep(2 * time.Second)
+	logFileName := fmt.Sprintf("test-logs/test_%s.log", testName)
 	logFileContents, err := os.ReadFile(logFileName)
 	logFileContentsString := string(logFileContents)
 	if err != nil {

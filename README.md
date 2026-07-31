@@ -188,9 +188,37 @@ Currently, the following OpenAI API endpoints are supported:
 
 - `/v1/completions`
 - `/v1/chat/completions`
+- `/v1/embeddings`
 - `/v1/models` (This one makes it work with, e.g., Open WebUI seamlessly).
 - `/v1/models/{model}`
-- More to come
+
+## Configuring Embedding Models
+
+Embedding models can be configured similarly to other OpenAI API compatible services. Here's an example configuration for an embedding model:
+
+```jsonc
+{
+  "OpenAiApi": {
+    "ListenPort": "7070",
+  },
+  "Services": [
+    {
+      "Name": "text-embedding-ada-002",
+      "OpenAiApi": true,
+      "ProxyTargetHost": "localhost",
+      "ProxyTargetPort": "18083",
+      "Command": "/opt/sentence-transformers/embedding-server",
+      "Args": "--port 18083",
+      "ResourceRequirements": {
+        "VRAM-GPU-1": 2000,
+        "RAM": 4000,
+      },
+    },
+  ],
+}
+```
+
+The embedding model will then be accessible via the OpenAI API endpoint by specifying `"model": "text-embedding-ada-002"` in your requests.
 
 ## Management API
 

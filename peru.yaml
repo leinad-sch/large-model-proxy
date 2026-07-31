@@ -1,0 +1,10 @@
+## github.com/openai/openai-openapi
+git module openai-openapi:
+  url: https://github.com/openai/openai-openapi.git
+  rev: main
+
+rule openapi-json:
+  pick: openapi.json
+
+imports:
+  openai-openapi|openapi-json: .llm/knowledge/openai-openapi/

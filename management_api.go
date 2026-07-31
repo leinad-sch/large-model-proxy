@@ -20,6 +20,7 @@ func handleStatus(responseWriter http.ResponseWriter, request *http.Request, ser
 		LastUsed             *time.Time     `json:"last_used"`
 		ServiceUrl           *string        `json:"service_url,omitempty"`
 		ResourceRequirements map[string]int `json:"resource_requirements"`
+		HealthCheckReturnCode *int          `json:"health_check_return_code,omitempty"`
 	}
 
 	// ResourceUsage represents the current usage of a resource
@@ -86,12 +87,12 @@ func handleStatus(responseWriter http.ResponseWriter, request *http.Request, ser
 				status.ServiceUrl = &renderedUrl
 			}
 		}
-
 		// Check if service is running
 		if runningService, ok := resourceManager.runningServices[service.Name]; ok {
 			status.IsRunning = true
 			status.ActiveConnections = runningService.activeConnections
 			status.LastUsed = runningService.lastUsed
+			status.HealthCheckReturnCode = runningService.healthCheckReturnCode
 
 			// Update resource usage by service
 			for resource, amount := range service.ResourceRequirements {

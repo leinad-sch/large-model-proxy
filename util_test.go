@@ -73,6 +73,27 @@ type OpenAiApiChatCompletionResponse struct {
 	} `json:"usage"`
 }
 
+// OpenAiApiEmbeddingRequest is used by /v1/embeddings
+type OpenAiApiEmbeddingRequest struct {
+	Model string   `json:"model"`
+	Input []string `json:"input"`
+}
+
+// OpenAiApiEmbeddingResponse is what /v1/embeddings returns
+type OpenAiApiEmbeddingResponse struct {
+	Object string `json:"object"`
+	Data   []struct {
+		Object    string    `json:"object"`
+		Index     int       `json:"index"`
+		Embedding []float64 `json:"embedding"`
+	} `json:"data"`
+	Model string `json:"model"`
+	Usage struct {
+		PromptTokens int `json:"prompt_tokens"`
+		TotalTokens  int `json:"total_tokens"`
+	} `json:"usage"`
+}
+
 func assertModelsResponse(test *testing.T, expectedIDs []string, resp *http.Response) {
 	test.Helper()
 	var modelsResp OpenAiApiModels
@@ -355,7 +376,7 @@ func startLargeModelProxy(testCaseName string, configPath string, workDir string
 	err = cmd.Process.Signal(syscall.Signal(0))
 	if err != nil {
 		if err.Error() == "os: process already finished" {
-			return nil, fmt.Errorf("large-model-proxy exited prematurely")
+			return nil, fmt.Errorf("large-model-proxy exited prematurely with error")
 		}
 		return nil, fmt.Errorf("error checking process state: %w", err)
 	}
@@ -501,16 +522,19 @@ func attemptReadHealthcheckResponse(t *testing.T, address string) (HealthCheckRe
 	t.Helper()
 	resp, err := http.Get(fmt.Sprintf("http://%s/", address))
 	if err != nil {
+		t.Logf("attemptReadHealthcheckResponse error for %s: %v", address, err)
 		return HealthCheckResponse{}, fmt.Errorf("failed to get healthcheck response: %w", err)
 	}
 	defer resp.Body.Close()
 
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
+		t.Logf("attemptReadHealthcheckResponse read body error for %s: %v", address, err)
 		return HealthCheckResponse{}, fmt.Errorf("failed to read body: %w", err)
 	}
 	var healthCheckResponse HealthCheckResponse
 	if err := json.Unmarshal(body, &healthCheckResponse); err != nil {
+		t.Logf("attemptReadHealthcheckResponse unmarshal error for %s, body=%s: %v", address, string(body), err)
 		return HealthCheckResponse{}, fmt.Errorf("failed to decode healthcheck response JSON: %w; body=%s", err, string(body))
 	}
 	return healthCheckResponse, nil
@@ -608,4 +632,44 @@ func assertRemoteClosedWithin(t *testing.T, connection net.Conn, within time.Dur
 
 func isConnectionReset(err error) bool {
 	return errors.Is(err, syscall.ECONNRESET) || errors.Is(err, syscall.ECONNABORTED)
+}
+
+func sendEmbeddingRequestExpectingSuccess(t *testing.T, address string, embeddingReq OpenAiApiEmbeddingRequest) OpenAiApiEmbeddingResponse {
+	t.Helper()
+	resp := sendEmbeddingRequest(t, address, embeddingReq)
+	defer func() {
+		_ = resp.Body.Close()
+	}()
+
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("Expected status code 200, got %d", resp.StatusCode)
+	}
+
+	var embeddingResp OpenAiApiEmbeddingResponse
+	if err := json.NewDecoder(resp.Body).Decode(&embeddingResp); err != nil {
+		t.Fatalf("Failed to decode /v1/embeddings response: %v", err)
+	}
+	return embeddingResp
+}
+
+func sendEmbeddingRequest(t *testing.T, address string, embeddingReq OpenAiApiEmbeddingRequest) *http.Response {
+	t.Helper()
+	reqBody, err := json.Marshal(embeddingReq)
+	if err != nil {
+		t.Fatalf("Failed to marshal JSON body: %v", err)
+	}
+
+	url := fmt.Sprintf("%s/v1/embeddings", address)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewBuffer(reqBody))
+	if err != nil {
+		t.Fatalf("Failed to create request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("/v1/embeddings request failed: %v", err)
+	}
+	return resp
 }

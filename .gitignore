@@ -3,5 +3,13 @@ logs
 test-logs
 package-build
 large-model-proxy
+large-model-proxy-linux-*
+large-model-proxy-test
+large-model-proxy-test-*
+large-model-proxy-*test-*
 test-server/test-server
 node_modules
+
+.idea/
+.peru/
+task*.md

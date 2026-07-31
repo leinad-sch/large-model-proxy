@@ -15,24 +15,28 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"github.com/google/shlex"
+	"golang.org/x/text/cases"
+	"golang.org/x/text/language"
 )
 
 type RunningService struct {
-	manageMutex       *sync.Mutex
-	cmd               *exec.Cmd
-	activeConnections int
-	lastUsed          *time.Time
-	idleTimer         *time.Timer
-	exitWaitGroup     *sync.WaitGroup
-	resourcesReleased *bool
-	stdoutWriter      *serviceLoggingWriter
-	stderrWriter      *serviceLoggingWriter
+	manageMutex           *sync.Mutex
+	cmd                   *exec.Cmd
+	activeConnections     int
+	lastUsed              *time.Time
+	idleTimer             *time.Timer
+	exitWaitGroup         *sync.WaitGroup
+	resourcesReleased     *bool
+	stdoutWriter          *serviceLoggingWriter
+	stderrWriter          *serviceLoggingWriter
+	healthCheckReturnCode *int // nil if no health check configured, HealthCheckNotYetRun (-1) if configured but not yet run, HealthCheckHealthy (0) if healthy, HealthCheckTimedOut (-2) if timed out, positive integer if health check failed with specific exit code
 }
 
 type ResourceManager struct {
@@ -54,6 +58,21 @@ type OpenAiApiModel struct {
 }
 type ModelContainingRequest struct {
 	Model string `json:"model"`
+}
+
+// SlotActionRequest represents the request body for slot actions
+type SlotActionRequest struct {
+	Action   string `json:"action"`   // "restore" or "save"
+	Filename string `json:"filename"` // "${slot}.bin"
+	SlotID   int    `json:"id_slot"`  // Slot identifier
+}
+
+// SlotActionResponse represents the response for slot actions
+type SlotActionResponse struct {
+	Success  bool   `json:"success"`
+	Message  string `json:"message,omitempty"`
+	SlotID   int    `json:"id_slot"`
+	Filename string `json:"filename"`
 }
 
 func (rm ResourceManager) maybeGetRunningServiceNoLock(name string) (RunningService, bool) {
@@ -112,12 +131,141 @@ func (rm ResourceManager) createRunningService(serviceConfig ServiceConfig) Runn
 	return rs
 }
 
-var (
-	config              Config
-	serviceConfigByName map[string]*ServiceConfig
-	resourceManager     ResourceManager
-	interrupted         = false
+const (
+	// Health check return code sentinel values.
+	// healthCheckReturnCode is nil if no health check is configured,
+	// points to one of these values, or points to a positive integer
+	// if the health check failed with a specific exit code.
+	// health check configured but not yet run/running
+	HealthCheckNotYetRun = -1
+	// health check passed
+	HealthCheckHealthy = 0
+	// health check timed out
+	HealthCheckTimedOut = -2
 )
+
+var (
+	config               Config
+	serviceConfigByName  map[string]*ServiceConfig
+	resourceManager      ResourceManager
+	interrupted          = false
+	slotManagementClient *http.Client // HTTP client for slot management
+)
+
+// initSlotManagementClient initializes the HTTP client for slot management API calls
+func initSlotManagementClient() {
+	slotManagementClient = &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			MaxIdleConnsPerHost: 10,
+			IdleConnTimeout:     90 * time.Second,
+		},
+	}
+}
+
+// slotParseResult holds the result of parsing slot arguments
+type slotParseResult struct {
+	hasParallel     bool
+	hasSlots        bool
+	hasSlotSavePath bool
+	slotSavePath    string
+	numSlots        int
+	err             error
+}
+
+// parseSlotArgs extracts slot configuration from service arguments
+func parseSlotArgs(argsStr string) slotParseResult {
+	args, err := shlex.Split(argsStr)
+	if err != nil {
+		return slotParseResult{err: err}
+	}
+
+	result := slotParseResult{}
+	hasParallel := false
+	hasSlots := false
+	hasSlotSavePath := false
+	var slotSavePath string
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--parallel":
+			hasParallel = true
+			if i+1 >= len(args) {
+				return slotParseResult{err: fmt.Errorf("--parallel argument missing value")}
+			}
+			numStr := args[i+1]
+			num, err := strconv.Atoi(numStr)
+			if err != nil {
+				return slotParseResult{err: fmt.Errorf("invalid --parallel value %q: %w", numStr, err)}
+			}
+			result.numSlots = num
+		case "--slots":
+			hasSlots = true
+		case "--slot-save-path":
+			hasSlotSavePath = true
+			if i+1 >= len(args) {
+				return slotParseResult{err: fmt.Errorf("--slot-save-path argument missing value")}
+			}
+			slotSavePath = args[i+1]
+		}
+	}
+
+	result.hasParallel = hasParallel
+	result.hasSlots = hasSlots
+	result.hasSlotSavePath = hasSlotSavePath
+	result.slotSavePath = slotSavePath
+	return result
+}
+
+// buildSlotFilename constructs the filename for a given slot ID
+func buildSlotFilename(slotID int) string {
+	return fmt.Sprintf("%d.bin", slotID)
+}
+
+// buildSlotFilePath constructs the full path to a slot file
+func buildSlotFilePath(slotSavePath string, slotID int) string {
+	return filepath.Join(slotSavePath, buildSlotFilename(slotID))
+}
+
+
+// manageSlots handles slot save/restore operations for a service
+func manageSlots(service ServiceConfig, action string) {
+	// Check if this is a llama-server with slots
+	lowerCommand := strings.ToLower(service.Command)
+	if !strings.Contains(lowerCommand, "llama-server") {
+		return
+	}
+
+	// Validate and extract info in one call
+	result := parseSlotArgs(service.Args)
+	if result.err != nil || !result.hasParallel || !result.hasSlots || !result.hasSlotSavePath {
+		return
+	}
+
+	slotSavePath := result.slotSavePath
+	numSlots := result.numSlots
+
+	log.Printf("[%s] %s %d slots from/to %s", service.Name, cases.Title(language.Und, cases.NoLower).String(action), numSlots, slotSavePath)
+
+	for slotID := 0; slotID < numSlots; slotID++ {
+		filename := buildSlotFilename(slotID)
+		var err error
+		if action == "save" {
+			_, err = performSlotAction(service, slotID, "save", filename)
+		} else {
+			err = restoreSlot(service, slotID, slotSavePath)
+		}
+		if err != nil {
+			log.Printf("[%s] Warning: Failed to %s slot %d: %v", service.Name, action, slotID, err)
+			// Continue with rest of slots
+		} else if action == "save" {
+			log.Printf("[%s] Slot %d saved successfully", service.Name, slotID)
+		} else {
+			log.Printf("[%s] Slot %d restored successfully", service.Name, slotID)
+		}
+	}
+}
 
 func main() {
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
@@ -157,6 +305,9 @@ func main() {
 		runningServices:    make(map[string]RunningService),
 		serviceMutex:       &sync.Mutex{},
 	}
+
+	// Initialize slot management HTTP client
+	initSlotManagementClient()
 
 	for name, resource := range config.ResourcesAvailable {
 		//Using int reference to avoid having a lock for reading from the map
@@ -198,6 +349,104 @@ func main() {
 	}
 }
 
+// performSlotAction sends a slot action request to the service
+func performSlotAction(serviceConfig ServiceConfig, slotID int, action string, filename string) (*SlotActionResponse, error) {
+	// Construct URL based on action
+	url := fmt.Sprintf("http://%s:%s/slots/%d?action=%s",
+		serviceConfig.ProxyTargetHost,
+		serviceConfig.ProxyTargetPort,
+		slotID,
+		action)
+
+	// Create payload with action, slot ID, and filename
+	payload := SlotActionRequest{
+		Action:   action,
+		SlotID:   slotID,
+		Filename: filename,
+	}
+
+	// Log the request for debugging
+	log.Printf("[%s] Slot %d %s request: action=%s, slot_id=%d, filename=%s",
+		serviceConfig.Name, slotID, action, action, slotID, filename)
+
+	// Marshal to JSON
+	jsonPayload, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	// Send HTTP POST request
+	resp, err := slotManagementClient.Post(url, "application/json", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return nil, fmt.Errorf("failed to send %s request: %w", action, err)
+	}
+	defer resp.Body.Close()
+
+	// Check response status
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		return nil, fmt.Errorf("%s request failed with status %d: %s", action, resp.StatusCode, string(body))
+	}
+
+	// Decode response
+	var respBody SlotActionResponse
+	if err := json.NewDecoder(resp.Body).Decode(&respBody); err != nil {
+		return nil, fmt.Errorf("failed to decode response: %w", err)
+	}
+
+	return &respBody, nil
+}
+
+// restoreSlot restores a slot from disk
+func restoreSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
+	// Construct file path
+	filePath := buildSlotFilePath(slotSavePath, slotID)
+
+	// Extract directory path from file path
+	dirPath := filepath.Dir(filePath)
+
+	// Check if directory exists
+	if _, err := os.Stat(dirPath); os.IsNotExist(err) {
+		log.Printf("[WARNING] Slot directory does not exist: %s. Slot restore may fail if the directory is expected to be managed externally.", dirPath)
+	} else if err != nil {
+		return fmt.Errorf("failed to check slot directory %s: %w", dirPath, err)
+	}
+
+	// Check if file exists
+	if _, err := os.Stat(filePath); os.IsNotExist(err) {
+		return fmt.Errorf("slot file not found: %s", filePath)
+	}
+
+	// Build the filename for the restore request
+	filename := buildSlotFilename(slotID)
+
+	// Send restore request to service
+	respBody, err := performSlotAction(serviceConfig, slotID, "restore", filename)
+	if err != nil {
+		return err
+	}
+
+	// Log success message with response data
+	log.Printf("[%s] Slot %d restored successfully: %s", serviceConfig.Name, slotID, respBody.Message)
+	return nil
+}
+
+// saveSlot saves a slot to disk
+func saveSlot(serviceConfig ServiceConfig, slotID int, slotSavePath string) error {
+	// Build the filename for the save request
+	filename := buildSlotFilename(slotID)
+
+	// Send save request to service
+	respBody, err := performSlotAction(serviceConfig, slotID, "save", filename)
+	if err != nil {
+		return err
+	}
+
+	// Log success message with response data
+	log.Printf("[%s] Slot %d saved successfully: %s", serviceConfig.Name, slotID, respBody.Message)
+	return nil
+}
+
 func findServiceConfigByName(serviceName string) *ServiceConfig {
 	if service, ok := serviceConfigByName[serviceName]; ok {
 		return service
@@ -220,12 +469,12 @@ type rawCaptureConnection struct {
 	buffer *bytes.Buffer
 }
 
-func (rcc *rawCaptureConnection) Read(p []byte) (int, error) {
-	n, err := rcc.Conn.Read(p)
+func (rawCaptureConn *rawCaptureConnection) Read(p []byte) (int, error) {
+	n, err := rawCaptureConn.Conn.Read(p)
 	if n > 0 {
-		rcc.mutex.Lock()
-		rcc.buffer.Write(p[:n])
-		rcc.mutex.Unlock()
+		rawCaptureConn.mutex.Lock()
+		rawCaptureConn.buffer.Write(p[:n])
+		rawCaptureConn.mutex.Unlock()
 	}
 	return n, err
 }
@@ -324,6 +573,60 @@ func startOpenAiApi(OpenAiApi OpenAiApi, services []ServiceConfig) {
 			resetConnectionBuffer(request)
 		}
 	})
+	mux.HandleFunc("/completion", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/infill", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/messages", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/responses", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/rerank", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/rerank", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/reranking", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/messages/count_tokens", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
+	mux.HandleFunc("/v1/embeddings", func(responseWriter http.ResponseWriter, request *http.Request) {
+		printRequestUrl(request)
+		if !handleCompletions(responseWriter, request, &modelToServiceMap) {
+			resetConnectionBuffer(request)
+		}
+	})
 	mux.HandleFunc("/", func(responseWriter http.ResponseWriter, request *http.Request) {
 		//404
 		log.Printf("[OpenAI API Server] Request to unsupported URL: %s %s", request.Method, request.RequestURI)
@@ -343,8 +646,8 @@ func startOpenAiApi(OpenAiApi OpenAiApi, services []ServiceConfig) {
 		// Whenever the server accepts a new net.Conn, this callback runs.
 		// If it's our rawCaptureConnection, store it in the request context.
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			if rcc, ok := c.(*rawCaptureConnection); ok {
-				return context.WithValue(ctx, rawConnectionContextKey, rcc)
+			if rawCaptureConn, ok := c.(*rawCaptureConnection); ok {
+				return context.WithValue(ctx, rawConnectionContextKey, rawCaptureConn)
 			}
 			return ctx
 		},
@@ -415,7 +718,7 @@ func handleCompletions(responseWriter http.ResponseWriter, request *http.Request
 		http.Error(responseWriter, "Request forwarding is not possible, please use HTTP 1.1", http.StatusInternalServerError)
 		return false
 	}
-	clientConnection, bufrw, err := hijacker.Hijack()
+	clientConnection, bufferedReaderWriter, err := hijacker.Hijack()
 	if err != nil {
 		log.Printf("[OpenAI API Server] Failed to forward connection: %v", err)
 		http.Error(responseWriter, err.Error(), http.StatusInternalServerError)
@@ -428,9 +731,9 @@ func handleCompletions(responseWriter http.ResponseWriter, request *http.Request
 	}
 	rawRequestBytes := rawConnection.buffer.Bytes()
 
-	if bufrw.Reader.Buffered() > 0 {
-		bufBytes := make([]byte, bufrw.Reader.Buffered())
-		if _, err := bufrw.Read(bufBytes); err != nil {
+	if bufferedReaderWriter.Reader.Buffered() > 0 {
+		bufBytes := make([]byte, bufferedReaderWriter.Reader.Buffered())
+		if _, err := bufferedReaderWriter.Read(bufBytes); err != nil {
 			log.Printf("[OpenAI API Server] Error reading buffered data: : %v", err)
 		}
 		bodyBytes = append(bodyBytes, bufBytes...)
@@ -636,7 +939,16 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 		startupConnectionTimeout = time.Duration(*serviceConfig.StartupTimeoutMilliseconds) * time.Millisecond
 	}
 	giveUpTime := time.Now().Add(startupConnectionTimeout)
-	err := performHealthCheck(serviceConfig, startupConnectionTimeout)
+
+	// Initialize health check return code to HealthCheckNotYetRun if health check is configured
+	if serviceConfig.HealthcheckCommand != "" {
+		code := HealthCheckNotYetRun
+		runningService.healthCheckReturnCode = &code
+	} else {
+		runningService.healthCheckReturnCode = nil
+	}
+
+	err := performHealthCheck(serviceConfig, startupConnectionTimeout, &runningService)
 	if err != nil {
 		log.Printf("[%s] Stopping service due to healthcheck error: %v", serviceConfig.Name, err)
 		runningService.manageMutex.Unlock()
@@ -648,6 +960,9 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 	if interrupted {
 		return nil, fmt.Errorf("interrupt signal was received")
 	}
+
+	// Check if this is a llama-server with slots and restore them
+	manageSlots(serviceConfig, "restore")
 
 	var serviceConnection, processExited = tryConnectingUntilTimeoutOrProcessExit(
 		serviceConfig.ProxyTargetHost,
@@ -675,21 +990,25 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 	}
 
 	idleTimeout := getIdleTimeout(serviceConfig)
-	runningService.idleTimer = time.AfterFunc(idleTimeout, func() {
-		if interrupted {
-			return
-		}
-		resourceManager.serviceMutex.Lock()
-		shouldStop := canBeStopped(serviceConfig.Name)
-		resourceManager.serviceMutex.Unlock()
-		if shouldStop {
-			log.Printf("[%s] Idle timeout %s reached, stopping service", serviceConfig.Name, idleTimeout)
-			stopService(serviceConfig)
-		} else {
-			log.Printf("[%s] Idle timeout %s reached, but service is busy, resetting idle time", serviceConfig.Name, idleTimeout)
-			runningService.idleTimer.Reset(getIdleTimeout(serviceConfig))
-		}
-	})
+	if idleTimeout == 0 {
+		// 0 means no idle timeout configured, don't create a timer
+	} else {
+		runningService.idleTimer = time.AfterFunc(idleTimeout, func() {
+			if interrupted {
+				return
+			}
+			resourceManager.serviceMutex.Lock()
+			shouldStop := canBeStopped(serviceConfig.Name)
+			resourceManager.serviceMutex.Unlock()
+			if shouldStop {
+				log.Printf("[%s] Idle timeout %s reached, stopping service", serviceConfig.Name, idleTimeout)
+				stopService(serviceConfig)
+			} else {
+				log.Printf("[%s] Idle timeout %s reached, but service is busy, resetting idle time", serviceConfig.Name, idleTimeout)
+				runningService.idleTimer.Reset(getIdleTimeout(serviceConfig))
+			}
+		})
+	}
 	if interrupted {
 		return nil, fmt.Errorf("interrupt signal was received")
 	}
@@ -700,7 +1019,24 @@ func startService(serviceConfig ServiceConfig) (net.Conn, error) {
 
 	return serviceConnection, nil
 }
-func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) error {
+
+func updateRunningServiceHealthCheckCode(serviceName string, code *int) {
+	resourceManager.serviceMutex.Lock()
+	if rs, ok := resourceManager.runningServices[serviceName]; ok {
+		rs.healthCheckReturnCode = code
+		resourceManager.runningServices[serviceName] = rs
+	}
+	resourceManager.serviceMutex.Unlock()
+}
+
+// updateHealthCheckCode updates both the local RunningService pointer
+// and the map entry with the health check return code.
+func updateHealthCheckCode(rs *RunningService, name string, code *int) {
+	rs.healthCheckReturnCode = code
+	updateRunningServiceHealthCheckCode(name, code)
+}
+
+func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration, runningService *RunningService) error {
 	if serviceConfig.HealthcheckCommand == "" {
 		return nil
 	}
@@ -715,6 +1051,9 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) erro
 		sleepDuration = time.Duration(serviceConfig.HealthcheckIntervalMilliseconds) * time.Millisecond
 	}
 
+	timeoutCode := HealthCheckTimedOut
+	healthyCode := HealthCheckHealthy
+
 	for {
 		if interrupted {
 			return errors.New("interrupt signal was received")
@@ -722,56 +1061,82 @@ func performHealthCheck(serviceConfig ServiceConfig, timeout time.Duration) erro
 
 		remainingUntilDeadlineDuration := time.Until(totalTimeoutDeadlineTime)
 		if remainingUntilDeadlineDuration <= 0 {
+			// Health check timed out before starting, set the timeout code
+			updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
 			return fmt.Errorf("healthcheck timed out after %s", timeout)
 		}
 
-		cmd := exec.Command("sh", "-c", serviceConfig.HealthcheckCommand)
+		ctx, cancel := context.WithTimeout(context.Background(), remainingUntilDeadlineDuration)
+		cmd := exec.CommandContext(ctx, "sh", "-c", serviceConfig.HealthcheckCommand)
+		cmd.SysProcAttr = &syscall.SysProcAttr{
+			Setpgid: true,
+			Pgid:    0,
+		}
 		if err := cmd.Start(); err != nil {
+			cancel()
 			log.Printf("[%s] Failed to start healthcheck command \"%s\": %v", serviceConfig.Name, serviceConfig.HealthcheckCommand, err)
+			updateHealthCheckCode(runningService, serviceConfig.Name, runningService.healthCheckReturnCode)
 			return fmt.Errorf("failed to start healthcheck command \"%s\": %w", serviceConfig.HealthcheckCommand, err)
 		}
 
-		waitResultChan := make(chan error, 1)
-		go func() { waitResultChan <- cmd.Wait() }()
+		// Use goroutine to wait for process completion, then select on context or process exit
+		errCh := make(chan error, 1)
+		go func() {
+			errCh <- cmd.Wait()
+		}()
 
-		var waitErr error
 		select {
-		case waitErr = <-waitResultChan:
-			// finished within the remaining time
-		case <-time.After(remainingUntilDeadlineDuration):
-			_ = cmd.Process.Kill()
-			<-waitResultChan
-			return fmt.Errorf("starting healthcheck command timed out after %s", remainingUntilDeadlineDuration)
-		}
+		case <-ctx.Done():
+			// Context cancelled or timed out - kill the process
+			cancel()
+			_ = cmd.Process.Kill() // Force terminate; error ignored as process may already be exiting
+			<-errCh                // Wait for Wait() to complete
+			updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
+			return fmt.Errorf("healthcheck command timed out after %s", remainingUntilDeadlineDuration)
+		case err := <-errCh:
+			// Process completed - check result
+			if ctx.Err() != nil {
+				// Context was also cancelled while waiting
+				cancel()
+				updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
+				return fmt.Errorf("healthcheck command timed out after %s", remainingUntilDeadlineDuration)
+			}
+			if err == nil {
+				log.Printf("[%s] Healthcheck \"%s\" returned exit code 0, healthcheck completed", serviceConfig.Name, serviceConfig.HealthcheckCommand)
+				cancel()
+				updateHealthCheckCode(runningService, serviceConfig.Name, &healthyCode)
+				return nil
+			}
+			// Health check command completed but with non-zero exit code
+			exitCode := -1
+			if exitError, ok := err.(*exec.ExitError); ok {
+				exitCode = exitError.ExitCode()
+			}
+			updateHealthCheckCode(runningService, serviceConfig.Name, &exitCode)
 
-		if waitErr == nil {
-			log.Printf("[%s] Healthcheck \"%s\" returned exit code 0, healthcheck completed", serviceConfig.Name, serviceConfig.HealthcheckCommand)
-			return nil
-		}
-
-		exitCode := -1
-		if exitError, ok := waitErr.(*exec.ExitError); ok {
-			exitCode = exitError.ExitCode()
-		}
-
-		log.Printf(
-			"[%s] Healthcheck \"%s\" returned exit code %d, trying again in %s",
-			serviceConfig.Name,
-			serviceConfig.HealthcheckCommand,
-			exitCode,
-			sleepDuration,
-		)
-
-		remainingUntilDeadlineDuration = time.Until(totalTimeoutDeadlineTime)
-		if sleepDuration > remainingUntilDeadlineDuration {
-			return fmt.Errorf(
-				"healthcheck timed out, not starting another healthcheck command due to less time than %dms left out of %s",
+			log.Printf(
+				"[%s] Healthcheck \"%s\" returned exit code %d, trying again in %s",
+				serviceConfig.Name,
+				serviceConfig.HealthcheckCommand,
+				exitCode,
 				sleepDuration,
-				timeout,
 			)
-		}
-		if sleepDuration > 0 {
-			time.Sleep(sleepDuration)
+
+			remainingUntilDeadlineDuration = time.Until(totalTimeoutDeadlineTime)
+			if sleepDuration > remainingUntilDeadlineDuration {
+				// Health check timed out, set the timeout code
+				cancel()
+				updateHealthCheckCode(runningService, serviceConfig.Name, &timeoutCode)
+				return fmt.Errorf(
+					"healthcheck timed out, not starting another healthcheck command due to less time than %dms left out of %s",
+					sleepDuration,
+					timeout,
+				)
+			}
+			if sleepDuration > 0 {
+				time.Sleep(sleepDuration)
+			}
+			cancel()
 		}
 	}
 }
@@ -798,6 +1163,7 @@ func connectToService(serviceConfig ServiceConfig) net.Conn {
 	}
 	return serviceConn
 }
+
 func tryConnectingUntilTimeoutOrProcessExit(
 	serviceHost string,
 	servicePort string,
@@ -1212,9 +1578,7 @@ func forwardConnection(clientConnection, serviceConnection net.Conn, serviceName
 			EOFOnWriteFromServerToClient = new(bool)
 			*EOFOnWriteFromServerToClient = true
 		}
-		// Once done copying client->service, close service side.
-		err := serviceConnection.Close()
-		if err != nil && !errors.Is(err, net.ErrClosed) {
+		if err := serviceConnection.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
 			log.Printf("[%s] Error closing service to client connection: %v", serviceName, err)
 		}
 	}()
@@ -1251,6 +1615,9 @@ func forwardConnection(clientConnection, serviceConnection net.Conn, serviceName
 }
 
 func stopService(service ServiceConfig) {
+	// Check if this is a llama-server with slots and save them
+	manageSlots(service, "save")
+
 	runningService, ok := resourceManager.maybeGetRunningService(service.Name)
 	if !ok {
 		log.Printf("[%s] Warning: Failed to find a service in a list of running services while stopping it, multiple stops requested or service already died. Stop aborted.", service.Name)
