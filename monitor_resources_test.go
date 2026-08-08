@@ -214,6 +214,13 @@ func testResourceCheckCommandShouldNotUseAnOutdatedResourceCheckResult(
 	// two to reach "running" instead of relying on a fixed sleep: the handover
 	// timing varies and a single check races on slow/loaded machines.
 	statusResponse = waitForServiceState(t, managementApiAddress, serviceTwoName, ServiceStateRunning, 5*time.Second)
+
+	// Wait for the WaitingConnections decrement that happens asynchronously when
+	// the service transitions from WaitingForResources to Starting (then Running).
+	waitForWaitingConnections(t, managementApiAddress, serviceTwoName, 0, 5*time.Second)
+
+	// Refresh statusResponse after WaitingConnections counters have settled.
+	statusResponse = getStatusFromManagementAPI(t, managementApiAddress)
 	verifyServiceStatus(t, statusResponse, serviceOneName, ServiceStateStopped, 0, 0, nil)
 	verifyServiceStatus(t, statusResponse, serviceTwoName, ServiceStateRunning, 0, 0, map[string]int{resourceName: 10})
 	verifyResourceUsage(t, statusResponse, map[string]int{resourceName: 0}, map[string]int{resourceName: 12}, map[string]int{resourceName: 10}, map[string]int{resourceName: 2})
