@@ -7,6 +7,8 @@ import (
 	"time"
 )
 
+const maxEvictionRetries = 10
+
 func reserveResources(resourceRequirements map[string]int, requestingService string, clientDisconnected <-chan struct{}) bool {
 	var resourceList []string
 	if len(resourceRequirements) == 0 {
@@ -28,6 +30,9 @@ func reserveResources(resourceRequirements map[string]int, requestingService str
 	defer maxWaitTimeTimer.Stop()
 	recheckNeeded := true
 	var pendingCheckChannels map[string]chan struct{}
+	evictionRetryCount := 0
+	// Track evicted services to avoid redundant eviction attempts
+	evictedServices := make(map[string]struct{})
 	for {
 		resourceManager.serviceMutex.Lock()
 		missingResource, pendingCheckChannels = findFirstMissingResourceWhenServiceMutexIsLocked(resourceRequirements, requestingService, true, recheckNeeded)
@@ -66,8 +71,45 @@ func reserveResources(resourceRequirements map[string]int, requestingService str
 
 		earliestLastUsedService := findEarliestLastUsedServiceUsingResource(requestingService, *missingResource)
 		if earliestLastUsedService != "" {
-			log.Printf("[%s] Stopping service to free resources for %s", earliestLastUsedService, requestingService)
-			stopService(*findServiceConfigByName(earliestLastUsedService))
+			// Check retry limit to prevent infinite eviction loops
+			if evictionRetryCount >= maxEvictionRetries {
+				log.Printf("[%s] Reached maximum eviction retries (%d), cannot free resources for %s", requestingService, maxEvictionRetries, requestingService)
+				resourceManager.resourceChangeByResourceMutex.Lock()
+				for resource := range resourceRequirements {
+					delete(resourceManager.resourceChangeByResourceChans[resource], requestingService)
+				}
+				resourceManager.resourceChangeByResourceMutex.Unlock()
+				return false
+			}
+			evictionRetryCount++
+
+			// Check if this service was already evicted in a previous iteration
+			if _, alreadyEvicted := evictedServices[earliestLastUsedService]; alreadyEvicted {
+				log.Printf("[%s] Service %s was already evicted but still missing resources, re-checking availability", requestingService, earliestLastUsedService)
+				// Clear the evicted set to avoid getting stuck on the same service
+				evictedServices = make(map[string]struct{})
+				recheckNeeded = true
+				continue
+			}
+			evictedServices[earliestLastUsedService] = struct{}{}
+
+			log.Printf("[%s] Stopping service to free resources for %s (eviction attempt %d/%d)", earliestLastUsedService, requestingService, evictionRetryCount, maxEvictionRetries)
+			stopResult := stopService(*findServiceConfigByName(earliestLastUsedService))
+			if stopResult == StopServiceNotFound || stopResult == StopServiceAlreadyStopped {
+				log.Printf("[%s] Service %s not found in runningServices during eviction, it was already cleaned up", requestingService, earliestLastUsedService)
+				// The service was already cleaned up, so resources should be free; re-check
+				recheckNeeded = true
+				continue
+			}
+
+			// Verify the service is actually removed from runningServices
+			resourceManager.serviceMutex.Lock()
+			_, stillRunning := resourceManager.runningServices[earliestLastUsedService]
+			resourceManager.serviceMutex.Unlock()
+			if stillRunning {
+				log.Printf("[%s] Warning: Service %s still in runningServices after stopService, cleanup may not have completed", requestingService, earliestLastUsedService)
+			}
+
 			// The stopped service may have changed the resource state (e.g. an exit
 			// script), so the cached amount is now stale: force a fresh CheckCommand
 			// run on the next pass instead of trusting the cache.

@@ -162,19 +162,33 @@ func produceStartCommandLogString(serviceConfig ServiceConfig) (string, []any) {
 	}
 	return logFormatString, logArguments
 }
-func stopService(service ServiceConfig) {
+// StopServiceResult indicates the outcome of a stop operation.
+type StopServiceResult int
+
+const (
+	StopServiceNotFound StopServiceResult = iota // service was not in runningServices
+	StopServiceSuccess                           // service was found and stop initiated
+	StopServiceAlreadyStopped                    // service was already cleaned up by monitorProcess
+)
+
+func stopService(service ServiceConfig) StopServiceResult {
 	runningService, ok := resourceManager.maybeGetRunningService(service.Name)
 	if !ok {
-		log.Printf("[%s] Warning: Failed to find a service in a list of running services while stopping it, multiple stops requested or service already died. Stop aborted.", service.Name)
-		return
+		log.Printf("[%s] Service not found in runningServices while stopping, already stopped or never started.", service.Name)
+		return StopServiceNotFound
 	}
-	stopRunningService(service, runningService)
+	result := stopRunningService(service, runningService)
+	if result == StopServiceAlreadyStopped {
+		log.Printf("[%s] Service already cleaned up by monitorProcess, stop aborted.", service.Name)
+		return StopServiceAlreadyStopped
+	}
+	return result
 }
 
 // stopRunningService is the body of stopService with the map lookup factored out,
 // so shutdown can stop each service directly from the held runningServices map
 // without re-acquiring serviceMutex via maybeGetRunningService.
-func stopRunningService(service ServiceConfig, runningService *RunningService) {
+func stopRunningService(service ServiceConfig, runningService *RunningService) StopServiceResult {
 	if interrupted.Load() {
 		//If the process is being interrupted, we want to stop the service no matter what, even if it's currently locked
 		runningService.manageMutex.TryLock()
@@ -225,7 +239,11 @@ func stopRunningService(service ServiceConfig, runningService *RunningService) {
 		log.Printf("[%s] Sending SIGTERM to service process group: -%d", service.Name, runningService.cmd.Process.Pid)
 		err := syscall.Kill(-runningService.cmd.Process.Pid, syscall.SIGTERM)
 		if err != nil {
-			log.Printf("[%s] Failed to send SIGTERM to -%d: %v", service.Name, runningService.cmd.Process.Pid, err)
+			if errors.Is(err, syscall.ESRCH) {
+				log.Printf("[%s] Process group -%d already dead after SIGTERM (ESRCH), treating as success", service.Name, runningService.cmd.Process.Pid)
+			} else {
+				log.Printf("[%s] Failed to send SIGTERM to -%d: %v", service.Name, runningService.cmd.Process.Pid, err)
+			}
 		}
 
 		processExitedCleanly := waitForProcessToTerminate(runningService.exitWaitGroup)
@@ -234,19 +252,31 @@ func stopRunningService(service ServiceConfig, runningService *RunningService) {
 			log.Printf("[%s] Timed out waiting, sending SIGKILL to service process group -%d", service.Name, runningService.cmd.Process.Pid)
 			err := syscall.Kill(-runningService.cmd.Process.Pid, syscall.SIGKILL)
 			if err != nil {
-				log.Printf("[%s] Failed to kill service: %v", service.Name, err)
-				if runningService.cmd.ProcessState == nil && !errors.Is(err, syscall.ESRCH) { //ESRCH means process not found
-					log.Printf("[%s] Manual action required due to error when killing process", service.Name)
-					return
+				if errors.Is(err, syscall.ESRCH) {
+					log.Printf("[%s] Process group -%d already dead after SIGKILL (ESRCH), treating as success", service.Name, runningService.cmd.Process.Pid)
+				} else {
+					log.Printf("[%s] Failed to kill service: %v", service.Name, err)
+					if runningService.cmd.ProcessState == nil {
+						log.Printf("[%s] Manual action required due to error when killing process", service.Name)
+						return StopServiceAlreadyStopped
+					}
 				}
 			}
 		}
 	}
-	if !interrupted.Load() && !*runningService.resourcesReleased {
+	if !interrupted.Load() {
 		resourceManager.serviceMutex.Lock()
+		// Check if monitorProcess already cleaned up
+		if *runningService.resourcesReleased {
+			resourceManager.serviceMutex.Unlock()
+			log.Printf("[%s] Resources already released by monitorProcess", service.Name)
+			return StopServiceAlreadyStopped
+		}
 		cleanUpStoppedServiceWhenServiceMutexIsLocked(&service, runningService, true)
 		resourceManager.serviceMutex.Unlock()
 	}
+	log.Printf("[%s] Stop signal sent successfully", service.Name)
+	return StopServiceSuccess
 }
 func monitorProcess(serviceName string, process *os.Process, runningService *RunningService) {
 	exitProcessState, err := process.Wait()
