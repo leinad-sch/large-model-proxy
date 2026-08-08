@@ -182,6 +182,9 @@ func stopRunningService(service ServiceConfig, runningService *RunningService) {
 		runningService.manageMutex.Lock()
 		defer runningService.manageMutex.Unlock()
 	}
+	// Save slots before process termination (covers both normal stop and shutdown paths)
+	manageSlots(service, "save")
+
 	// idleTimer is also accessed (and nilled) under serviceMutex in
 	// cleanUpStoppedServiceWhenServiceMutexIsLocked; take serviceMutex here so
 	// the read/Stop agrees with that write on the same lock. stopService already

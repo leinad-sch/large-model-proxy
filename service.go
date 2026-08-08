@@ -144,6 +144,9 @@ func startService(serviceConfig ServiceConfig, clientDisconnected <-chan struct{
 		return nil, fmt.Errorf("interrupt signal was received")
 	}
 
+	// Check if this is a llama-server with slots and restore them
+	manageSlots(serviceConfig, "restore")
+
 	var serviceConnection, processExited = tryConnectingUntilTimeoutOrProcessExit(
 		serviceConfig.ProxyTargetHost,
 		serviceConfig.ProxyTargetPort,
