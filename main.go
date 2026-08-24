@@ -174,6 +174,7 @@ func main() {
 				resource.CheckCommand,
 				time.Duration(resource.CheckWhenNotEnoughIntervalMilliseconds)*time.Millisecond,
 				resourceManager.monitorUnpauseChans[name],
+				resource.CheckCommandPollMode,
 				&resourceManager,
 			)
 		}

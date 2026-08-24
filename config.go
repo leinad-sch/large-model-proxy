@@ -86,6 +86,13 @@ const (
 	LogLevelNormal LogLevel = "Normal"
 )
 
+type PollMode string
+
+const (
+	PollModeOnDemand PollMode = "on-demand"
+	PollModeAlways   PollMode = "always"
+)
+
 func (ll *LogLevel) UnmarshalJSON(data []byte) error {
 	var s string
 	if err := json.Unmarshal(data, &s); err != nil {
@@ -138,6 +145,7 @@ type ResourceAvailable struct {
 	Amount                                 int
 	CheckCommand                           string
 	CheckWhenNotEnoughIntervalMilliseconds uint
+	CheckCommandPollMode                   PollMode
 }
 
 // Accepts either a JSON number or an object with {Amount, CheckCommand}.
@@ -156,9 +164,10 @@ func (r *ResourceAvailable) UnmarshalJSON(data []byte) error {
 	}
 
 	var dto struct {
-		Amount                                 int    `json:"Amount"`
-		CheckCommand                           string `json:"CheckCommand"`
-		CheckWhenNotEnoughIntervalMilliseconds uint   `json:"CheckWhenNotEnoughIntervalMilliseconds"`
+		Amount                                 int       `json:"Amount"`
+		CheckCommand                           string    `json:"CheckCommand"`
+		CheckWhenNotEnoughIntervalMilliseconds uint      `json:"CheckWhenNotEnoughIntervalMilliseconds"`
+		CheckCommandPollMode                   PollMode  `json:"CheckCommandPollMode"`
 	}
 
 	dec := json.NewDecoder(bytes.NewReader(trimmed))
@@ -169,7 +178,12 @@ func (r *ResourceAvailable) UnmarshalJSON(data []byte) error {
 		if dto.CheckWhenNotEnoughIntervalMilliseconds == 0 {
 			dto.CheckWhenNotEnoughIntervalMilliseconds = 1000
 		}
-		*r = ResourceAvailable{Amount: dto.Amount, CheckCommand: dto.CheckCommand, CheckWhenNotEnoughIntervalMilliseconds: dto.CheckWhenNotEnoughIntervalMilliseconds}
+		if dto.CheckCommandPollMode == "" {
+			dto.CheckCommandPollMode = PollModeAlways
+		} else if dto.CheckCommandPollMode != PollModeAlways && dto.CheckCommandPollMode != PollModeOnDemand {
+			return fmt.Errorf("invalid CheckCommandPollMode %q for resource (must be %q or %q)", dto.CheckCommandPollMode, PollModeAlways, PollModeOnDemand)
+		}
+		*r = ResourceAvailable{Amount: dto.Amount, CheckCommand: dto.CheckCommand, CheckWhenNotEnoughIntervalMilliseconds: dto.CheckWhenNotEnoughIntervalMilliseconds, CheckCommandPollMode: dto.CheckCommandPollMode}
 		return nil
 	}
 
