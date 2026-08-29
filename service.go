@@ -135,7 +135,7 @@ func startService(serviceConfig ServiceConfig, clientDisconnected <-chan struct{
 	if err != nil {
 		log.Printf("[%s] Stopping service due to healthcheck error: %v", serviceConfig.Name, err)
 		runningService.manageMutex.Unlock()
-		stopService(serviceConfig)
+		_ = stopService(serviceConfig)
 		releaseReservedResources(serviceConfig.ResourceRequirements)
 		return nil, fmt.Errorf("healthcheck failed: %w", err)
 	}
@@ -143,6 +143,9 @@ func startService(serviceConfig ServiceConfig, clientDisconnected <-chan struct{
 	if interrupted.Load() {
 		return nil, fmt.Errorf("interrupt signal was received")
 	}
+
+	// Check if this is a llama-server with slots and restore them
+	manageSlots(serviceConfig, "restore")
 
 	var serviceConnection, processExited = tryConnectingUntilTimeoutOrProcessExit(
 		serviceConfig.ProxyTargetHost,
@@ -156,14 +159,14 @@ func startService(serviceConfig ServiceConfig, clientDisconnected <-chan struct{
 		if processExited {
 			log.Printf("[%s] Process terminated before a connection to the service could be established, stopping the service", serviceConfig.Name)
 			runningService.manageMutex.Unlock()
-			stopService(serviceConfig)
+			_ = stopService(serviceConfig)
 			releaseReservedResources(serviceConfig.ResourceRequirements)
 			return nil, fmt.Errorf("process terminated before a connection to the service could be established")
 		}
 		//This log has to happen before the mutex unlock to maintain a logical order of logs
 		log.Printf("[%s] Failed to connect to %s:%s, stopping the service", serviceConfig.Name, serviceConfig.ProxyTargetHost, serviceConfig.ProxyTargetPort)
 		runningService.manageMutex.Unlock()
-		stopService(serviceConfig)
+		_ = stopService(serviceConfig)
 		releaseReservedResources(serviceConfig.ResourceRequirements)
 		return nil, fmt.Errorf("failed to connect to service")
 	}
@@ -200,7 +203,7 @@ func startService(serviceConfig ServiceConfig, clientDisconnected <-chan struct{
 		if shouldStop {
 			resourceManager.serviceMutex.Unlock()
 			log.Printf("[%s] Idle timeout %s reached, stopping service", serviceConfig.Name, idleTimeout)
-			stopService(serviceConfig)
+			_ = stopService(serviceConfig)
 		} else {
 			runningService.idleTimer.Reset(getIdleTimeout(serviceConfig))
 			resourceManager.serviceMutex.Unlock()
@@ -329,7 +332,7 @@ func connectToService(serviceConfig ServiceConfig, clientDisconnected <-chan str
 			log.Printf("[%s] Restarting service due to connection error", serviceConfig.Name)
 			_, isRunning := resourceManager.maybeGetRunningService(serviceConfig.Name)
 			if isRunning {
-				stopService(serviceConfig)
+				_ = stopService(serviceConfig)
 			}
 			serviceConn, err = startService(serviceConfig, clientDisconnected)
 			if err != nil {

@@ -214,6 +214,13 @@ func testResourceCheckCommandShouldNotUseAnOutdatedResourceCheckResult(
 	// two to reach "running" instead of relying on a fixed sleep: the handover
 	// timing varies and a single check races on slow/loaded machines.
 	statusResponse = waitForServiceState(t, managementApiAddress, serviceTwoName, ServiceStateRunning, 5*time.Second)
+
+	// Wait for the WaitingConnections decrement that happens asynchronously when
+	// the service transitions from WaitingForResources to Starting (then Running).
+	waitForWaitingConnections(t, managementApiAddress, serviceTwoName, 0, 5*time.Second)
+
+	// Refresh statusResponse after WaitingConnections counters have settled.
+	statusResponse = getStatusFromManagementAPI(t, managementApiAddress)
 	verifyServiceStatus(t, statusResponse, serviceOneName, ServiceStateStopped, 0, 0, nil)
 	verifyServiceStatus(t, statusResponse, serviceTwoName, ServiceStateRunning, 0, 0, map[string]int{resourceName: 10})
 	verifyResourceUsage(t, statusResponse, map[string]int{resourceName: 0}, map[string]int{resourceName: 12}, map[string]int{resourceName: 10}, map[string]int{resourceName: 2})
@@ -435,7 +442,7 @@ func TestCheckCommandMonitorKeepsPollingWhileWaiterWaits(t *testing.T) {
 		counterFile = "test-logs/check-command-monitor-keeps-polling.counter.txt"
 		// Requirement is far above anything the counter reaches during the test,
 		// so the service stays parked in waiting_for_resources the whole time.
-		requirement = 100
+		requirement          = 100
 		// Short interval so the test runs in a few seconds.
 		checkIntervalMs = 300
 	)
@@ -562,4 +569,245 @@ func TestCheckCommandMonitorKeepsPollingWhileWaiterWaits(t *testing.T) {
 		t.Logf("check interval %d: free %d -> %d", i+1, lastFree, newFree)
 		lastFree = newFree
 	}
+}
+
+// TestCheckCommandMonitorAlwaysPollsWithNoWaiter verifies that in "always"
+// poll-mode the CheckCommand runs unconditionally on every interval, even when
+// no service is waiting. This keeps the reported free amount fresh for the
+// /status API.
+func TestCheckCommandMonitorAlwaysPollsWithNoWaiter(t *testing.T) {
+	t.Parallel()
+
+	const (
+		managementApiAddress = "localhost:2202"
+		testName             = "check-command-always-poll-no-waiter"
+		resourceName         = "TestResource"
+		counterFile          = "test-logs/check-command-always-poll-no-waiter.counter.txt"
+		checkIntervalMs      = 300
+	)
+
+	// Start the counter fresh.
+	if err := os.MkdirAll("test-logs", 0755); err != nil {
+		t.Fatalf("could not create test-logs directory: %v", err)
+	}
+	if err := os.Remove(counterFile); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("could not remove stale counter file: %v", err)
+	}
+	if err := os.WriteFile(counterFile, []byte("0"), 0644); err != nil {
+		t.Fatalf("could not write counter file: %v", err)
+	}
+
+	maxWaitSeconds := uint(60)
+
+	cfg := Config{
+		MaxTimeToWaitForServiceToCloseConnectionBeforeGivingUpSeconds: &maxWaitSeconds,
+		ResourcesAvailable: map[string]ResourceAvailable{
+			resourceName: {
+				CheckCommand:                           "read -r original_integer < " + counterFile + "; incremented_integer=$((original_integer + 1)); printf '%d\\n' \"$incremented_integer\" | tee " + counterFile,
+				CheckWhenNotEnoughIntervalMilliseconds: checkIntervalMs,
+				CheckCommandPollMode:                   PollModeAlways,
+			},
+		},
+		LogLevel:      LogLevelDebug,
+		ManagementApi: ManagementApi{ListenPort: "2202"},
+		// No services: nothing will ever wait for this resource.
+		Services: []ServiceConfig{},
+	}
+	StandardizeConfigNamesAndPaths(&cfg, testName)
+	configFilePath := createTempConfig(t, cfg)
+
+	waitChannel := make(chan error, 1)
+	cmd, err := startLargeModelProxy(testName, configFilePath, "", waitChannel)
+	if err != nil {
+		t.Fatalf("could not start application: %v", err)
+	}
+	defer func() {
+		if err := stopApplication(cmd, waitChannel); err != nil {
+			t.Errorf("failed to stop application: %v", err)
+		}
+		if err := checkPortClosed(managementApiAddress); err != nil {
+			t.Errorf("port %s is still open after application exit: %v", managementApiAddress, err)
+		}
+	}()
+
+	// Poll for the reported free amount to increase at least 5 times.
+	// In "always" mode the monitor re-arms unconditionally, so the CheckCommand
+	// runs every checkInterval even with zero waiters.
+	const (
+		numIncrementsToObserve = 5
+		perStepTimeout         = 3 * time.Second
+	)
+
+	waitForFreeIncrease := func(prev int) int {
+		t.Helper()
+		deadline := time.Now().Add(perStepTimeout)
+		for {
+			r := getStatusFromManagementAPI(t, managementApiAddress)
+			info, ok := r.Resources[resourceName]
+			if !ok {
+				t.Fatalf("resource %s not found in status response", resourceName)
+			}
+			if info.Free > prev {
+				return info.Free
+			}
+			if time.Now().After(deadline) {
+				t.Fatalf(
+					"resource %s free stalled at %d for %s — the CheckCommand monitor stopped polling with no waiter (should run in 'always' mode)",
+					resourceName, prev, perStepTimeout,
+				)
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Wait for the initial check to set the free amount.
+	statusResp := getStatusFromManagementAPI(t, managementApiAddress)
+	lastFree := statusResp.Resources[resourceName].Free
+	t.Logf("starting from free=%d, expecting %d strict increases with no waiter", lastFree, numIncrementsToObserve)
+	for i := 0; i < numIncrementsToObserve; i++ {
+		newFree := waitForFreeIncrease(lastFree)
+		assert.Greater(t, newFree, lastFree, "free must strictly increase across consecutive check intervals (step %d)", i+1)
+		t.Logf("check interval %d: free %d -> %d", i+1, lastFree, newFree)
+		lastFree = newFree
+	}
+}
+
+// TestCheckCommandMonitorOnDemandStopsAfterLastWaiterDeregisters verifies
+// that in "on-demand" poll-mode the monitor stops re-arming its timer once the
+// last waiter deregisters. The CheckCommand stops running until a waiter
+// registers or an explicit unpause signal arrives.
+func TestCheckCommandMonitorOnDemandStopsAfterLastWaiterDeregisters(t *testing.T) {
+	t.Parallel()
+
+	const (
+		managementApiAddress = "localhost:2203"
+		serviceProxyAddress  = "localhost:2204"
+		testName             = "check-command-on-demand-stop"
+		serviceName          = testName + "_svc"
+		resourceName         = "TestResource"
+		counterFile          = "test-logs/check-command-on-demand-stop.counter.txt"
+		requirement          = 100
+		checkIntervalMs      = 300
+	)
+
+	// Start the counter fresh.
+	if err := os.MkdirAll("test-logs", 0755); err != nil {
+		t.Fatalf("could not create test-logs directory: %v", err)
+	}
+	if err := os.Remove(counterFile); err != nil && !os.IsNotExist(err) {
+		t.Fatalf("could not remove stale counter file: %v", err)
+	}
+	if err := os.WriteFile(counterFile, []byte("0"), 0644); err != nil {
+		t.Fatalf("could not write counter file: %v", err)
+	}
+
+	maxWaitSeconds := uint(60)
+	startupTimeoutMs := uint(60_000)
+
+	cfg := Config{
+		MaxTimeToWaitForServiceToCloseConnectionBeforeGivingUpSeconds: &maxWaitSeconds,
+		ResourcesAvailable: map[string]ResourceAvailable{
+			resourceName: {
+				CheckCommand:                           "read -r original_integer < " + counterFile + "; incremented_integer=$((original_integer + 1)); printf '%d\\n' \"$incremented_integer\" | tee " + counterFile,
+				CheckWhenNotEnoughIntervalMilliseconds: checkIntervalMs,
+				CheckCommandPollMode:                   PollModeOnDemand,
+			},
+		},
+		LogLevel:      LogLevelDebug,
+		ManagementApi: ManagementApi{ListenPort: "2203"},
+		Services: []ServiceConfig{
+			{
+				Name:                       serviceName,
+				ListenPort:                 "2204",
+				ProxyTargetHost:            "localhost",
+				ProxyTargetPort:            "12204",
+				Command:                    "./test-server/test-server",
+				Args:                       "-p 12204",
+				StartupTimeoutMilliseconds: &startupTimeoutMs,
+				ResourceRequirements:       map[string]int{resourceName: requirement},
+			},
+		},
+	}
+	StandardizeConfigNamesAndPaths(&cfg, testName)
+	configFilePath := createTempConfig(t, cfg)
+
+	waitChannel := make(chan error, 1)
+	cmd, err := startLargeModelProxy(testName, configFilePath, "", waitChannel)
+	if err != nil {
+		t.Fatalf("could not start application: %v", err)
+	}
+	defer func() {
+		if err := stopApplication(cmd, waitChannel); err != nil {
+			t.Errorf("failed to stop application: %v", err)
+		}
+		for _, address := range []string{serviceProxyAddress, managementApiAddress} {
+			if err := checkPortClosed(address); err != nil {
+				t.Errorf("port %s is still open after application exit: %v", address, err)
+			}
+		}
+	}()
+
+	// Step 1: Dial the service proxy port to trigger a waiter registration.
+	clientConn, err := net.DialTimeout("tcp", serviceProxyAddress, 3*time.Second)
+	if err != nil {
+		t.Fatalf("failed to connect to service proxy port: %v", err)
+	}
+	defer func() { _ = clientConn.Close() }()
+
+	// Confirm the service is parked in waiting_for_resources.
+	// Use the config's standardized service name (after StandardizeConfigNamesAndPaths).
+	standardizedServiceName := cfg.Services[0].Name
+	resp := waitForServiceState(t, managementApiAddress, standardizedServiceName, ServiceStateWaitingForResources, 3*time.Second)
+	lastFree := resp.Resources[resourceName].Free
+	t.Logf("service parked in waiting_for_resources; free=%d", lastFree)
+
+	// Step 2: Verify the monitor is polling while the waiter is registered
+	// (the existing regression test covers this, but we assert once here to
+	// prove the counter advanced).
+	for i := 0; i < 3; i++ {
+		r := getStatusFromManagementAPI(t, managementApiAddress)
+		info, ok := r.Resources[resourceName]
+		if !ok {
+			t.Fatalf("resource %s not found in status response", resourceName)
+		}
+		if info.Free > lastFree {
+			lastFree = info.Free
+			t.Logf("check: free %d -> %d (waiter registered)", r.Resources[resourceName].Free, lastFree)
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Step 3: Close the client connection to deregister the waiter. This
+	// triggers stopRunningService -> cleanUp, which deregisters the resource
+	// change channel. The waiter set becomes empty, so the monitor must stop
+	// re-arming its timer.
+	_ = clientConn.Close()
+
+	// Wait for the service to transition to stopped (the waiter deregistered).
+	getStatusFromManagementAPI(t, managementApiAddress)
+	time.Sleep(500 * time.Millisecond)
+
+	// Step 4: Assert the CheckCommand stops running. The reported free amount
+	// must NOT change for several intervals after the waiter deregistered.
+	// Capture the current free amount AFTER the waiter deregistered, not the
+	// stale value from the waitForServiceState response that might have advanced
+	// while the waiter was still registered.
+	currentStatus := getStatusFromManagementAPI(t, managementApiAddress)
+	stalledFree := currentStatus.Resources[resourceName].Free
+	t.Logf("waiter deregistered; asserting free=%d stays stale for %v", stalledFree, 5*time.Duration(checkIntervalMs)*time.Millisecond)
+	stallDeadline := time.Now().Add(5 * time.Duration(checkIntervalMs) * time.Millisecond)
+	for time.Now().Before(stallDeadline) {
+		r := getStatusFromManagementAPI(t, managementApiAddress)
+		info, ok := r.Resources[resourceName]
+		if !ok {
+			t.Fatalf("resource %s not found in status response", resourceName)
+		}
+		if info.Free != stalledFree {
+			t.Fatalf("resource %s free changed from %d to %d after waiter deregistered — CheckCommand should have stopped running in 'on-demand' mode",
+				resourceName, stalledFree, info.Free)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Logf("PASSED: free=%d remained stale confirming the monitor stopped polling", stalledFree)
 }

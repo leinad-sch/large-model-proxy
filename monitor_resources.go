@@ -14,6 +14,7 @@ func monitorResourceAvailability(
 	checkCommand string,
 	checkInterval time.Duration,
 	pauseResumeChan chan struct{},
+	pollMode PollMode,
 	resourceManager *ResourceManager,
 ) {
 	timer := time.NewTimer(0) // fire immediately to perform the initial check
@@ -46,7 +47,12 @@ func monitorResourceAvailability(
 			}
 			hadListeners = checkResourceAvailabilityWithKnownCommand(resourceName, checkCommand, resourceManager)
 		}
-		if hadListeners {
+		// In PollModeAlways the timer is re-armed unconditionally so the reported
+		// free amount stays current for the /status API even when nothing is
+		// waiting. In PollModeOnDemand the timer is re-armed only when the just-run
+		// check had at least one registered waiter (captured under the broadcast
+		// lock, see checkResourceAvailabilityWithKnownCommand).
+		if pollMode == PollModeAlways || hadListeners {
 			timer.Reset(checkInterval)
 		}
 	}
@@ -54,14 +60,28 @@ func monitorResourceAvailability(
 
 // checkResourceAvailabilityWithKnownCommand runs the resource's CheckCommand,
 // caches the result, broadcasts it to any registered waiters, and reports
-// whether at least one waiter was registered (so the monitor knows to keep
-// polling). hadListeners is captured WHILE holding the broadcast lock — i.e.
-// before any waiter can deregister (a waiter only wakes and deregisters after
-// this lock is released). Reading the waiter set in a later, separate critical
-// section races with a waiter's deregister→re-register window and can
-// transiently observe an empty set, which would stop the monitor from polling
-// and stall a CheckCommand resource's reported amount (and any waiter on it)
-// until the waiter's maxWait deadline.
+// whether at least one waiter was registered.
+//
+// The returned hadListeners value is captured WHILE holding the broadcast lock
+// — i.e. before any waiter can deregister (a waiter only wakes and deregisters
+// after this lock is released). This race-free snapshot drives the monitor's
+// timer re-arm decision:
+//
+//   - In PollModeOnDemand the monitor only re-arms its interval timer when
+//     hadListeners is true. The CheckCommand stops running once the last waiter
+//     deregisters, resuming only when a waiter registers or an explicit unpause
+//     signal arrives.
+//   - In PollModeAlways the monitor re-arms the timer unconditionally after every
+//     check, so the reported free amount stays current for the /status API even
+//     when no service is waiting. In this mode hadListeners is not used to gate
+//     re-arming (the returned value is still returned by the function for use
+//     by callers that may need it).
+//
+// Reading the waiter set in a later, separate critical section races with a
+// waiter's deregister→re-register window and can transiently observe an empty
+// set, which would stop the monitor from polling and stall a CheckCommand
+// resource's reported amount (and any waiter on it) until the waiter's maxWait
+// deadline.
 func checkResourceAvailabilityWithKnownCommand(resourceName string, checkCommand string, resourceManager *ResourceManager) (hadListeners bool) {
 	if config.LogLevel == LogLevelDebug {
 		log.Printf("[Resource Monitor][%s] Running check command \"%s\"", resourceName, checkCommand)

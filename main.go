@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"maps"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -105,6 +106,7 @@ var (
 	serviceConfigByName map[string]*ServiceConfig
 	resourceManager     ResourceManager
 	interrupted         atomic.Bool
+	slotManagementClient *http.Client // HTTP client for slot management
 )
 
 func main() {
@@ -155,6 +157,9 @@ func main() {
 		resourceManager.connectionStats[serviceName] = ServiceConnectionStats{proxied: 0, waiting: 0}
 	}
 
+	// Initialize slot management HTTP client
+	initSlotManagementClient()
+
 	for name, resource := range config.ResourcesAvailable {
 		resourceManager.resourcesAvailable[name] = 0
 		resourceManager.resourcesInUse[name] = 0
@@ -169,6 +174,7 @@ func main() {
 				resource.CheckCommand,
 				time.Duration(resource.CheckWhenNotEnoughIntervalMilliseconds)*time.Millisecond,
 				resourceManager.monitorUnpauseChans[name],
+				resource.CheckCommandPollMode,
 				&resourceManager,
 			)
 		}
